@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 import subprocess
 import threading
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,7 +19,7 @@ from openagent_bridge.budget import BudgetLimits, BudgetTracker
 from openagent_bridge.task_prompt import TaskPromptRenderer
 from openagent_bridge.config import BridgeConfig
 from openagent_bridge.db import Database
-from openagent_bridge.models import CommandSpec, TaskStatus
+from openagent_bridge.models import TaskStatus
 from openagent_bridge.queue import TaskQueue
 from openagent_bridge.recovery import RECOVERABLE_STATUSES, TaskRecovery
 from openagent_bridge.repair import AutonomousRepairLoop
@@ -205,6 +205,7 @@ class Worker:
             contract = TaskPromptRenderer.for_execution(
                 self.db.get_task(task_id) or task, limits,
                 data_dir=self.config.data_dir, repo_path=repo_root, worktree=worktree_path,
+                policy=asdict(self.config.policy),
             )
             cmd_spec = adapter.build_command(
                 prompt=contract,

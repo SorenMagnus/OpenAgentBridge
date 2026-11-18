@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import subprocess
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -52,10 +51,9 @@ def build_repair_prompt(
     diff_stat: str,
 ) -> str:
     """Construct an immutable, structured repair prompt for the coding agent."""
-    lines = [
-        "You are tasked with fixing test/build failures in this repository.",
-        f"OBJECTIVE (IMMUTABLE): {original_goal}",
-    ]
+    lines = ["You are tasked with fixing test/build failures in this repository."]
+    if original_goal:
+        lines.append(f"OBJECTIVE (IMMUTABLE): {original_goal}")
 
     if constraints:
         lines.append("CONSTRAINTS:")
@@ -116,18 +114,6 @@ class AutonomousRepairLoop:
         """Execute bounded autonomous repair loop."""
         worktree_path = Path(worktree_path)
         task_id = str(task["id"])
-        original_goal = str(task.get("original_goal") or task.get("goal", ""))
-        constraints = task.get("constraints", [])
-        if isinstance(constraints, str):
-            import json
-            try: constraints = json.loads(constraints)
-            except Exception: constraints = []
-        non_goals = task.get("non_goals", [])
-        if isinstance(non_goals, str):
-            import json
-            try: non_goals = json.loads(non_goals)
-            except Exception: non_goals = []
-
         # Initialize budget and progress tracker
         tracker = tracker or BudgetTracker.resume(BudgetLimits.for_task(task, self.budget_limits), self.db, task_id)
         contract = contract or TaskPromptRenderer.render(task, tracker.limits, worktree=worktree_path)
@@ -274,9 +260,9 @@ class AutonomousRepairLoop:
                         pass
 
             repair_prompt = build_repair_prompt(
-                original_goal=original_goal,
-                constraints=constraints,
-                non_goals=non_goals,
+                original_goal="",
+                constraints=[],
+                non_goals=[],
                 failing_checks=report.critical_failures,
                 error_summary="\n---\n".join(error_snippets),
                 diff_stat=current_diff.stat,

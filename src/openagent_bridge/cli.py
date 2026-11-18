@@ -112,6 +112,8 @@ def cmd_project_add(args: argparse.Namespace) -> int:
 
 def cmd_task_submit(args: argparse.Namespace) -> int:
     """Submit a task from a JSON spec file."""
+    from dataclasses import asdict
+
     from openagent_bridge.config import load_config
     from openagent_bridge.db import Database
     from openagent_bridge.models import TaskSpec, TaskStatus
@@ -168,13 +170,18 @@ def cmd_task_submit(args: argparse.Namespace) -> int:
     # d. Check repo dirty status
     repo_mgr = RepositoryManager()
     project_path = Path(args.project) if hasattr(args, "project") and args.project else Path.cwd()
-    try:
-        repo_info = repo_mgr.check_repo(project_path)
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    repo_info = None
+    preflight_exceeded, _ = tracker.is_exceeded()
+    if not preflight_exceeded:
+        try:
+            repo_info = repo_mgr.check_repo(project_path, deadline=tracker.deadline)
+        except subprocess.TimeoutExpired:
+            pass  # Record the task and its exhausted budget below.
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
 
-    if repo_info.get("dirty"):
+    if repo_info is not None and repo_info.dirty:
         # Insert task as BLOCKED
         db.insert_task({
             "id": task_id,
@@ -212,8 +219,8 @@ def cmd_task_submit(args: argparse.Namespace) -> int:
         "constraints": spec.constraints,
         "acceptance": spec.acceptance,
         "status": TaskStatus.NEW.value,
-        "base_commit": repo_info.get("head_sha", ""),
-        "branch": f"openagent/{task_id}",
+        "base_commit": repo_info.head_sha if repo_info else "",
+        "branch": f"openagent/{task_id}" if repo_info else "",
         "worktree_path": "",
         "created_at": _utcnow(),
         "updated_at": _utcnow(),
@@ -236,8 +243,8 @@ def cmd_task_submit(args: argparse.Namespace) -> int:
 
     db.transition_task(task_id, TaskStatus.PREPARING.value, {"type": "task.preparing"})
     exceeded, reason = tracker.is_exceeded()
-    if exceeded:
-        return stop_for_budget(reason)
+    if exceeded or repo_info is None:
+        return stop_for_budget(reason or "Repository inspection deadline reached")
     try:
         worktree_path = repo_mgr.create_worktree(
             repo_root=Path(repo_info["repo_root"]),
@@ -281,6 +288,7 @@ def cmd_task_submit(args: argparse.Namespace) -> int:
         prompt=TaskPromptRenderer.for_execution(
             task_data, tracker.limits, data_dir=config.data_dir,
             repo_path=Path(repo_info["repo_root"]), worktree=worktree_path,
+            policy=asdict(config.policy),
         ),
         worktree=worktree_path,
         sandbox_mode="workspace-write",

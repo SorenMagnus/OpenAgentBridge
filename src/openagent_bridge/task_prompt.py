@@ -21,6 +21,7 @@ class TaskPromptRenderer:
         data_dir: Path,
         repo_path: Path | None,
         worktree: Path,
+        policy: dict[str, Any],
     ) -> str:
         champion = PromptRegistry(data_dir / "prompts").get_champion("coding_task")
         return cls.render(
@@ -28,6 +29,7 @@ class TaskPromptRenderer:
             limits,
             champion.content if champion else "",
             repo_path=repo_path,
+            policy=policy,
             worktree=worktree,
             guidance_version=champion.version if champion else None,
         )
@@ -41,6 +43,7 @@ class TaskPromptRenderer:
         repo_path: Path | None = None,
         worktree: Path | None = None,
         guidance_version: int | None = None,
+        policy: dict[str, Any] | None = None,
     ) -> str:
         contract = {
             "schema_version": 1,
@@ -53,11 +56,16 @@ class TaskPromptRenderer:
                 "base_commit": task.get("base_commit"),
             },
             "effective_budget": asdict(limits),
+            "administrator_policy": policy or {},
+            "guidance_version": guidance_version,
             "evidence_requirements": (
                 "Record changed files, checks run, observed results, and unverified criteria. "
                 "Provide paths for relevant artifacts and logs."
             ),
-            "stop_conditions": "Stop at budget limits, missing permissions, or completion.",
+            "stop_conditions": (
+                "Stop at budget limits, missing permissions, or completion. "
+                "Work within approvals, administrator policy, and task permissions."
+            ),
         }
         for field, default in (
             ("constraints", []), ("non_goals", []), ("permissions", {}), ("acceptance", {})
