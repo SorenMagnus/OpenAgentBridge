@@ -562,6 +562,45 @@ def cmd_reject(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Start HTTP REST server and background worker."""
+    import threading
+    import time
+    from openagent_bridge.config import load_config
+    from openagent_bridge.core import BridgeCore
+    from openagent_bridge.channels.http_channel import HTTPChannelAdapter
+    from openagent_bridge.worker import Worker
+
+    config = load_config(Path(args.config) if args.config else None)
+    core = BridgeCore(config)
+
+    host = getattr(args, "host", "0.0.0.0") or "0.0.0.0"
+    port = int(getattr(args, "port", 8765) or 8765)
+
+    http_adapter = HTTPChannelAdapter(host=host, port=port)
+    core.register_channel_adapter(http_adapter)
+    http_adapter.start()
+
+    print(f"[*] OpenAgent Bridge HTTP server running on http://{host}:{port}")
+    print(f"[*] Health Check: http://{host}:{port}/health")
+    print(f"[*] Task Endpoint: POST http://{host}:{port}/api/v1/tasks")
+
+    worker = Worker(config=config, worker_id="worker-http-1")
+    worker_thread = threading.Thread(target=worker.run_forever, daemon=True)
+    worker_thread.start()
+    print(f"[*] Background worker started (worker_id={worker.worker_id})")
+    print("[*] Ready to accept tasks from Muse or remote clients. Press Ctrl+C to stop.")
+
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\nStopping OpenAgent Bridge server...")
+        http_adapter.stop()
+        worker.stop()
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # argument parser
 # ---------------------------------------------------------------------------
@@ -634,6 +673,11 @@ def build_parser() -> argparse.ArgumentParser:
     reject_parser.add_argument("approval_id", help="Approval ID")
     reject_parser.add_argument("--by", default=None, help="Rejecter identity")
 
+    # serve
+    serve_parser = subparsers.add_parser("serve", help="Start HTTP REST API server and background worker")
+    serve_parser.add_argument("--host", default="0.0.0.0", help="HTTP server bind host (default: 0.0.0.0)")
+    serve_parser.add_argument("--port", "-p", type=int, default=8765, help="HTTP server bind port (default: 8765)")
+
     return parser
 
 
@@ -651,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
         "pause": cmd_pause,
         "resume": cmd_resume,
         "worker": cmd_worker,
+        "serve": cmd_serve,
         "events": cmd_events,
         "recover": cmd_recover,
         "cancel": cmd_cancel,
