@@ -527,6 +527,40 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_approve(args: argparse.Namespace) -> int:
+    """Approve a pending approval request."""
+    from openagent_bridge.config import load_config
+    from openagent_bridge.db import Database
+    from openagent_bridge.approvals import ApprovalGate
+
+    config = load_config(Path(args.config) if args.config else None)
+    db = Database(config.data_dir / "bridge.db")
+    gate = ApprovalGate(db)
+    success = gate.resolve(args.approval_id, decision="approved", resolved_by=args.by or "human")
+    if success:
+        print(f"Approval {args.approval_id} APPROVED by {args.by or 'human'}.")
+        return 0
+    print(f"Failed to approve {args.approval_id} (not found or already resolved).", file=sys.stderr)
+    return 1
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    """Reject a pending approval request."""
+    from openagent_bridge.config import load_config
+    from openagent_bridge.db import Database
+    from openagent_bridge.approvals import ApprovalGate
+
+    config = load_config(Path(args.config) if args.config else None)
+    db = Database(config.data_dir / "bridge.db")
+    gate = ApprovalGate(db)
+    success = gate.resolve(args.approval_id, decision="rejected", resolved_by=args.by or "human")
+    if success:
+        print(f"Approval {args.approval_id} REJECTED by {args.by or 'human'}.")
+        return 0
+    print(f"Failed to reject {args.approval_id} (not found or already resolved).", file=sys.stderr)
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # argument parser
 # ---------------------------------------------------------------------------
@@ -590,6 +624,15 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_parser.add_argument("task_id", help="Task ID to cancel")
     cancel_parser.add_argument("--reason", default=None, help="Reason for cancellation")
 
+    # approve / reject
+    approve_parser = subparsers.add_parser("approve", help="Approve an approval request")
+    approve_parser.add_argument("approval_id", help="Approval ID")
+    approve_parser.add_argument("--by", default=None, help="Approver identity")
+
+    reject_parser = subparsers.add_parser("reject", help="Reject an approval request")
+    reject_parser.add_argument("approval_id", help="Approval ID")
+    reject_parser.add_argument("--by", default=None, help="Rejecter identity")
+
     return parser
 
 
@@ -610,6 +653,8 @@ def main(argv: list[str] | None = None) -> int:
         "events": cmd_events,
         "recover": cmd_recover,
         "cancel": cmd_cancel,
+        "approve": cmd_approve,
+        "reject": cmd_reject,
     }
 
     if args.command in dispatch:

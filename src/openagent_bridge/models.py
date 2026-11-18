@@ -40,6 +40,10 @@ class TaskStatus(str, Enum):
 VALID_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.NEW: frozenset({
         TaskStatus.VALIDATING,
+        TaskStatus.PREPARING,
+        TaskStatus.QUEUED,
+        TaskStatus.RUNNING,
+        TaskStatus.VERIFYING,
         TaskStatus.CANCELLED,
     }),
     TaskStatus.VALIDATING: frozenset({
@@ -68,6 +72,7 @@ VALID_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         TaskStatus.REPAIR_PLANNED,
         TaskStatus.REVIEW_REQUIRED,
         TaskStatus.FAILED,
+        TaskStatus.BUDGET_EXCEEDED,
     }),
     TaskStatus.REPAIR_PLANNED: frozenset({
         TaskStatus.RECOVERING,
