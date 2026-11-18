@@ -33,6 +33,14 @@ class CodexAdapter(AgentAdapter):
 
     def __init__(self, binary_path: str = "codex") -> None:
         self.binary_path = binary_path
+        if binary_path == "codex":
+            # Auto-detect newest installed Codex binary if available
+            appdata_codex = Path.home() / "AppData" / "Local" / "OpenAI" / "Codex" / "bin"
+            if appdata_codex.exists():
+                candidates = list(appdata_codex.glob("**/codex.exe"))
+                if candidates:
+                    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    self.binary_path = str(candidates[0])
 
     def detect(self) -> bool:
         """Check if codex CLI is installed and on PATH."""

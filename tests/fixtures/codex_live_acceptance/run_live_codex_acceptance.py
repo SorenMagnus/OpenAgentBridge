@@ -1,0 +1,138 @@
+"""Script for live OpenAI Codex end-to-end acceptance testing.
+
+Run after OpenAI account quota resets (e.g. after 9:10 PM):
+    python tests/fixtures/codex_live_acceptance/run_live_codex_acceptance.py
+"""
+
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# Ensure openagent_bridge is on sys.path
+root_dir = Path(__file__).resolve().parents[3]
+src_dir = root_dir / "src"
+if str(src_dir) not in sys.path:
+    sys.path.insert(0, str(src_dir))
+
+from openagent_bridge.adapters.codex import CodexAdapter, is_quota_blocked
+from openagent_bridge.budget import BudgetLimits
+from openagent_bridge.db import Database
+from openagent_bridge.models import TaskStatus
+from openagent_bridge.repair import AutonomousRepairLoop
+from openagent_bridge.repository import RepositoryManager
+from openagent_bridge.runner import CommandRunner
+
+
+def main() -> int:
+    print("=" * 70)
+    print("OpenAgent Bridge — Live Codex End-to-End Acceptance Test")
+    print("=" * 70)
+
+    adapter = CodexAdapter()
+    if not adapter.detect():
+        print("ERROR: codex CLI is not installed or not found on PATH.", file=sys.stderr)
+        return 1
+
+    caps = adapter.capabilities()
+    print(f"[*] Codex Adapter detected: version={caps.get('version', 'unknown')}")
+
+    # Isolated test repository directory
+    base_dir = Path(__file__).resolve().parent
+    sandbox_repo = base_dir / "repo"
+    bridge_data = base_dir / "bridge_data"
+
+    if sandbox_repo.exists():
+        shutil.rmtree(sandbox_repo, ignore_errors=True)
+    if bridge_data.exists():
+        shutil.rmtree(bridge_data, ignore_errors=True)
+
+    sandbox_repo.mkdir(parents=True, exist_ok=True)
+    bridge_data.mkdir(parents=True, exist_ok=True)
+
+    # Initialize Git repository
+    print(f"[*] Initializing clean Git repository in {sandbox_repo}...")
+    subprocess.run(["git", "init"], cwd=str(sandbox_repo), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "LiveTester"], cwd=str(sandbox_repo), check=True)
+    subprocess.run(["git", "config", "user.email", "livetester@example.com"], cwd=str(sandbox_repo), check=True)
+
+    # Write buggy calc.py and unit test
+    calc_code = (
+        "def add(a: int, b: int) -> int:\n"
+        "    return a - b  # deliberate defect: subtraction instead of addition\n"
+    )
+    (sandbox_repo / "calc.py").write_text(calc_code, encoding="utf-8")
+
+    test_code = (
+        "from calc import add\n\n"
+        "def test_add():\n"
+        "    assert add(2, 3) == 5\n"
+    )
+    (sandbox_repo / "test_calc.py").write_text(test_code, encoding="utf-8")
+    (sandbox_repo / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
+
+    subprocess.run(["git", "add", "calc.py", "test_calc.py", ".gitignore"], cwd=str(sandbox_repo), check=True)
+    subprocess.run(["git", "commit", "-m", "init: repo with deliberate bug in calc.py"], cwd=str(sandbox_repo), check=True)
+
+    # Set up Bridge
+    db = Database(bridge_data / "bridge.db")
+    runner = CommandRunner(artifact_dir=bridge_data / "artifacts")
+    repo_mgr = RepositoryManager()
+
+    task_id = "codex-live-acceptance-task"
+    print(f"[*] Creating isolated Git worktree for task {task_id}...")
+    worktree_path = repo_mgr.create_worktree(
+        repo_root=sandbox_repo,
+        task_id=task_id,
+        data_dir=bridge_data,
+    )
+
+    task_spec = {
+        "id": task_id,
+        "project_id": "codex_live_sandbox",
+        "goal": "Fix addition function in calc.py so that test_calc.py passes.",
+        "original_goal": "Fix addition in calc.py",
+        "status": TaskStatus.NEW.value,
+        "worktree_path": str(worktree_path),
+        "acceptance": {
+            "commands": [
+                f"{sys.executable} -m pytest test_calc.py"
+            ]
+        },
+    }
+    db.insert_task(task_spec)
+
+    limits = BudgetLimits(max_iterations=2, max_agent_invocations=2)
+    loop = AutonomousRepairLoop(db=db, runner=runner, budget_limits=limits)
+
+    print("[*] Starting AutonomousRepairLoop with real Codex...")
+    result = loop.run_loop(task=task_spec, worktree_path=worktree_path, adapter=adapter)
+
+    print("\n" + "=" * 70)
+    print("Execution Result Summary:")
+    print(f"  Final Status:    {result.final_status}")
+    print(f"  Iterations Run:  {result.iterations_run}")
+    print(f"  Overall Pass:    {result.overall_pass}")
+    print(f"  Stop Reason:     {result.stop_reason}")
+    print("=" * 70)
+
+    if result.final_status == TaskStatus.BLOCKED.value and "quota" in result.stop_reason.lower():
+        print("\n[!] CODEX QUOTA NOTICE: Account is still blocked by OpenAI usage limit.")
+        print("    Please re-run this script after your quota window resets.")
+        return 2
+
+    # If successfully repaired by Codex
+    if result.overall_pass:
+        print("\n[+] SUCCESS! Codex autonomously diagnosed and fixed the defect.")
+        diff = repo_mgr.get_diff(worktree_path)
+        print("\n--- Real Git Diff Generated by Codex ---")
+        print(diff.full_diff)
+        print("----------------------------------------")
+        return 0
+
+    print(f"\n[-] Acceptance check not fully satisfied: {result.stop_reason}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
