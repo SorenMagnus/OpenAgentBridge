@@ -1,6 +1,6 @@
 [build-system]
 requires = ["hatchling"]
-build-backend = "hatchling.backends"
+build-backend = "hatchling.build"
 
 [project]
 name = "openagent-bridge"
@@ -13,6 +13,7 @@ keywords = ["ai", "agent", "orchestration", "bridge"]
 dependencies = [
     "psutil",
     "watchdog",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]

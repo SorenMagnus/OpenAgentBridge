@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
@@ -105,18 +105,23 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
             parsed = urlparse(self.path)
             parts = [p for p in parsed.path.split("/") if p]
 
+            # Fast-path authentication check before reading payload body (prevents Slowloris / DoS)
+            user_id = self._get_auth_user()
+            if not user_id:
+                self._send_json(401, {"error": "Unauthorized: Invalid or missing API key"})
+                return
+
             length = int(self.headers.get("Content-Length", 0))
+            if length > 10 * 1024 * 1024:  # 10MB limit
+                self._send_json(413, {"error": "Payload too large"})
+                return
+
             body = self.rfile.read(length) if length > 0 else b"{}"
 
             try:
                 data = json.loads(body.decode("utf-8"))
             except Exception:
                 self._send_json(400, {"error": "Invalid JSON payload"})
-                return
-
-            user_id = self._get_auth_user()
-            if not user_id:
-                self._send_json(401, {"error": "Unauthorized: Invalid or missing API key"})
                 return
 
             core = adapter.core
@@ -188,7 +193,7 @@ class HTTPChannelAdapter(BaseChannelAdapter):
         super().__init__()
         self.host = host
         self.port = port
-        self.server: HTTPServer | None = None
+        self.server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.sent_updates: list[dict[str, Any]] = []
 
@@ -196,7 +201,7 @@ class HTTPChannelAdapter(BaseChannelAdapter):
         if self._running:
             return
         handler_cls = _make_http_handler(self)
-        self.server = HTTPServer((self.host, self.port), handler_cls)
+        self.server = ThreadingHTTPServer((self.host, self.port), handler_cls)
         self._running = True
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self._thread.start()

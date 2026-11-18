@@ -97,6 +97,33 @@ class Worker:
         worktree_path_str = task.get("worktree_path")
         worktree_path = Path(worktree_path_str) if worktree_path_str else None
 
+        # Automatically initialize worktree if missing (e.g. tasks submitted via HTTP / Bot)
+        if not worktree_path or not worktree_path.exists():
+            project_id = task.get("project_id", "")
+            project = self.db.get_project(project_id)
+            if project and project.get("path"):
+                repo_root = Path(project["path"])
+                try:
+                    worktree_path = self.repo_mgr.create_worktree(
+                        repo_root=repo_root,
+                        task_id=task_id,
+                        data_dir=self.config.data_dir,
+                    )
+                    self.db.connection.execute(
+                        "UPDATE tasks SET worktree_path = ?, branch = ? WHERE id = ?",
+                        (str(worktree_path), f"openagent/{task_id}", task_id),
+                    )
+                    self.db.connection.commit()
+                    logger.info("Initialized worktree for task %s at %s", task_id, worktree_path)
+                except Exception as exc:
+                    logger.exception("Failed to initialize worktree for task %s: %s", task_id, exc)
+                    self.db.transition_task(
+                        task_id,
+                        TaskStatus.BLOCKED.value,
+                        {"type": "task.blocked", "reason": f"Worktree initialization failed: {exc}"},
+                    )
+                    return {"task_id": task_id, "status": "BLOCKED", "reason": str(exc)}
+
         # Transition to RUNNING
         self.db.transition_task(
             task_id,
