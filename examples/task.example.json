@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.1",
+  "task_id": null,
+  "idempotency_key": "example-task-001",
+  "project_id": "demo-project",
+  "goal": "Fix login page error while maintaining existing functionality",
+  "original_goal": "Fix login page error while maintaining existing functionality",
+  "non_goals": ["Do not refactor the entire auth system", "Do not upgrade unrelated dependencies"],
+  "constraints": ["Do not modify production secrets", "Do not modify main branch"],
+  "acceptance": {
+    "commands": [["python", "-m", "pytest", "-q"]],
+    "required_files": [],
+    "forbidden_paths": [".env", "secrets/"]
+  },
+  "executor": {"preferred": "codex", "fallback": "claude-code"},
+  "budget": {"max_iterations": 5, "max_wall_minutes": 120, "max_agent_invocations": 8},
+  "permissions": {"filesystem": "task_worktree", "network": "deny_by_default", "merge": "human_approval", "deploy": "forbidden"}
+}

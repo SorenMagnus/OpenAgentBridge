@@ -1,0 +1,59 @@
+# ============================================================================
+# OpenAgent Bridge — example configuration
+# ============================================================================
+# Copy this file to ~/.openagent/config.yaml (or point OPENAGENT_CONFIG at it)
+# and customise the values below.  Every key shown here is optional — omitted
+# keys fall back to the defaults indicated in the comments.
+
+# Where task data, logs, and artifacts are stored.
+# Supports ~ expansion and paths with spaces.
+data_dir: ~/.openagent  # default: ~/.openagent
+
+# ---------------------------------------------------------------------------
+# Worker pool
+# ---------------------------------------------------------------------------
+worker:
+  concurrency: 2            # max parallel tasks
+  heartbeat_seconds: 30     # interval between heartbeats (s)
+  lease_seconds: 300        # how long a lease is valid (s)
+
+# ---------------------------------------------------------------------------
+# Subprocess runner
+# ---------------------------------------------------------------------------
+runner:
+  default_timeout_seconds: 600   # per-command timeout
+  kill_grace_seconds: 10         # SIGTERM → SIGKILL grace period
+  max_log_bytes: 10485760        # 10 MiB cap on captured stdout/stderr
+
+# ---------------------------------------------------------------------------
+# Autonomy guardrails
+# ---------------------------------------------------------------------------
+autonomy:
+  enabled: true                  # allow autonomous iteration
+  max_iterations: 5              # hard cap on repair loops
+  max_wall_minutes: 30           # wall-clock budget per task
+  max_agent_invocations: 10      # total agent calls per task
+  stop_after_no_improvement: 2   # stop if N consecutive runs show no progress
+
+# ---------------------------------------------------------------------------
+# Policy flags
+# ---------------------------------------------------------------------------
+policy:
+  merge_main: false     # allow merging into main/trunk
+  deploy: false         # allow deployment actions
+  network: false        # allow network access during runs
+  dirty_worktree: false # allow running in a dirty worktree
+
+# ---------------------------------------------------------------------------
+# File-system watcher (future)
+# ---------------------------------------------------------------------------
+watcher:
+  enabled: false        # enable file-change triggers
+  debounce_ms: 500      # debounce window in milliseconds
+
+# ---------------------------------------------------------------------------
+# Agent selection
+# ---------------------------------------------------------------------------
+agent:
+  preferred: ""         # e.g. "claude-code", "codex"
+  fallback: ""          # e.g. "aider"
