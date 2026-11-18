@@ -233,12 +233,35 @@ class Database:
             "non_goals", "constraints", "acceptance",
             "executor", "permissions", "budget",
         }
+        task_columns = {
+            "id", "idempotency_key", "project_id", "goal", "original_goal",
+            "non_goals", "constraints", "acceptance", "status", "base_commit",
+            "branch", "worktree_path", "created_at", "updated_at", "iteration",
+            "max_iterations", "max_wall_minutes", "lease_owner", "lease_until",
+            "heartbeat_at", "executor", "permissions", "budget",
+        }
+
+        # Normalize project_id if passed as project_name
+        spec_copy = dict(task_spec)
+        if "project_name" in spec_copy and "project_id" not in spec_copy:
+            spec_copy["project_id"] = spec_copy["project_name"]
+
+        # If budget dict provided, propagate scalar limits if not explicitly set
+        if isinstance(spec_copy.get("budget"), dict):
+            b = spec_copy["budget"]
+            if "max_iterations" in b and "max_iterations" not in spec_copy:
+                spec_copy["max_iterations"] = b["max_iterations"]
+            if "max_wall_minutes" in b and "max_wall_minutes" not in spec_copy:
+                spec_copy["max_wall_minutes"] = b["max_wall_minutes"]
+
         row: dict[str, Any] = {"id": task_id, "created_at": now, "updated_at": now}
-        for key, value in task_spec.items():
+        for key, value in spec_copy.items():
+            if key not in task_columns:
+                continue
             if key in json_cols and not isinstance(value, str) and value is not None:
                 row[key] = json.dumps(value)
             else:
-                row[key] = value
+                row[key] = _to_str(value)
         row.setdefault("status", "NEW")
         row.setdefault("iteration", 0)
 
