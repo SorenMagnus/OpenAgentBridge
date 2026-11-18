@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from openagent_bridge.access_control import User
 from openagent_bridge.channels.base import BaseChannelAdapter
 from openagent_bridge.models import UnifiedTaskRequest
 
@@ -25,13 +26,14 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode("utf-8"))
+            if self.command != "HEAD":
+                self.wfile.write(json.dumps(data).encode("utf-8"))
 
-        def _get_auth_user(self) -> str:
+        def _get_auth_user(self) -> User | None:
             """Extract and validate authentication token."""
             core = adapter.core
             if not core:
-                return "anonymous"
+                return None
 
             auth_header = self.headers.get("Authorization", "")
             api_key = self.headers.get("X-API-Key", "")
@@ -41,12 +43,21 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
             elif api_key:
                 token = api_key.strip()
 
-            if core.config.auth.enabled and core.config.auth.api_tokens:
-                if token not in core.config.auth.api_tokens:
-                    return ""
+            if core.config.auth.enabled:
+                if not token or token not in core.config.auth.api_tokens:
+                    return None
+            return core.acl.authenticate("http", token or "anonymous")
 
-            user = core.acl.authenticate("http", token or "anonymous")
-            return user.id if user else "anonymous"
+        def _authorized_task(self, principal, task_id, action):
+            core = adapter.core
+            task = core.db.get_task(task_id)
+            if task and core.acl.authorize_task_action(principal, task, action)[0]:
+                return task
+            self._send_json(404, {"error": "Task not found"})
+            return None
+
+        def do_HEAD(self):
+            self.do_GET()
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -56,8 +67,8 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
                 self._send_json(200, {"status": "ok", "channel": "http"})
                 return
 
-            user_id = self._get_auth_user()
-            if not user_id:
+            principal = self._get_auth_user()
+            if not principal:
                 self._send_json(401, {"error": "Unauthorized: Invalid or missing API key"})
                 return
 
@@ -68,13 +79,26 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
 
             # GET /api/v1/projects
             if len(parts) >= 3 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "projects":
-                projects = core.get_projects(user_id=user_id)
+                projects = core.get_projects(user_id=principal.id, principal=principal)
                 self._send_json(200, {"projects": projects})
                 return
+
+            if parts[0] == "tasks":
+                parts = ["api", "v1", *parts]
 
             # GET /api/v1/tasks/<id> or /tasks/<id>/events
             if len(parts) >= 4 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "tasks":
                 task_id = parts[3]
+                task = self._authorized_task(principal, task_id, "view")
+                if task is None:
+                    return
+                if parts[4:5] == ["artifacts"]:
+                    from openagent_bridge.artifacts import serve_artifact
+                    serve_artifact(self, core, task, parts)
+                    return
+                if parts[4:] == ["report"]:
+                    self._send_json(200, core.get_task_report(task_id, principal.id, principal=principal))
+                    return
                 if len(parts) == 5 and parts[4] == "events":
                     events = core.events.get_events(task_id)
                     self._send_json(200, {"task_id": task_id, "events": events})
@@ -95,11 +119,6 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
                         or bool(Path(rel_path_str).drive)
                     ):
                         self._send_json(400, {"error": "Absolute paths not allowed"})
-                        return
-
-                    task = core.db.get_task(task_id)
-                    if not task:
-                        self._send_json(404, {"error": "Task not found"})
                         return
 
                     worktree_raw = task.get("worktree_path")
@@ -144,7 +163,8 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
                         return
 
                     try:
-                        raw_bytes = target_path.read_bytes()
+                        with target_path.open("rb") as stream:
+                            raw_bytes = stream.read(max_size + 1)
                     except OSError:
                         self._send_json(500, {"error": "Failed to read file"})
                         return
@@ -178,26 +198,9 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
                     )
                     return
 
-                task = core.db.get_task(task_id)
-                if task:
+                if len(parts) == 4:
                     self._send_json(200, task)
-                else:
-                    self._send_json(404, {"error": "Task not found"})
-                return
-
-            # Legacy compatibility /tasks/<id>
-            if parts[0] == "tasks" and len(parts) >= 2:
-                task_id = parts[1]
-                if len(parts) == 3 and parts[2] == "events":
-                    events = core.events.get_events(task_id)
-                    self._send_json(200, {"task_id": task_id, "events": events})
                     return
-                task = core.db.get_task(task_id)
-                if task:
-                    self._send_json(200, task)
-                else:
-                    self._send_json(404, {"error": "Task not found"})
-                return
 
             self._send_json(404, {"error": "Endpoint not found"})
 
@@ -206,12 +209,18 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
             parts = [p for p in parsed.path.split("/") if p]
 
             # Fast-path authentication check before reading payload body (prevents Slowloris / DoS)
-            user_id = self._get_auth_user()
-            if not user_id:
+            principal = self._get_auth_user()
+            if not principal:
                 self._send_json(401, {"error": "Unauthorized: Invalid or missing API key"})
                 return
 
-            length = int(self.headers.get("Content-Length", 0))
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                if length < 0:
+                    raise ValueError
+            except ValueError:
+                self._send_json(400, {"error": "Invalid Content-Length"})
+                return
             if length > 10 * 1024 * 1024:  # 10MB limit
                 self._send_json(413, {"error": "Payload too large"})
                 return
@@ -220,6 +229,8 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
 
             try:
                 data = json.loads(body.decode("utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError
             except Exception:
                 self._send_json(400, {"error": "Invalid JSON payload"})
                 return
@@ -236,7 +247,7 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
                 req = UnifiedTaskRequest(
                     project_id=data.get("project_id", data.get("project_name", "")),
                     user_goal=data.get("goal", data.get("user_goal", "")),
-                    user_id=user_id,
+                    user_id=principal.id,
                     source_channel="http",
                     idempotency_key=data.get("idempotency_key"),
                     non_goals=data.get("non_goals", []),
@@ -259,8 +270,10 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
                 len(parts) == 3 and parts[0] == "tasks" and parts[2] == "cancel"
             ):
                 task_id = parts[1] if parts[0] == "tasks" else parts[3]
+                if self._authorized_task(principal, task_id, "cancel") is None:
+                    return
                 reason = data.get("reason", "Cancelled via HTTP")
-                ok, msg = core.cancel_task(task_id, user_id=user_id, reason=reason)
+                ok, msg = core.cancel_task(task_id, user_id=principal.id, reason=reason, principal=principal)
                 if ok:
                     self._send_json(200, {"task_id": task_id, "cancelled": True})
                 else:
@@ -270,9 +283,18 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
             # POST /api/v1/approvals/<id>/resolve
             if len(parts) == 5 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "approvals" and parts[4] == "resolve":
                 approval_id = parts[3] or data.get("approval_id", "")
-                approved = bool(data.get("approved", False))
+                approved = data.get("approved")
+                if not isinstance(approved, bool):
+                    self._send_json(400, {"error": "approved must be a boolean"})
+                    return
+                row = core.db.connection.execute("SELECT task_id FROM approvals WHERE id = ?", (approval_id,)).fetchone()
+                if row is None:
+                    self._send_json(404, {"error": "Approval not found"})
+                    return
+                if self._authorized_task(principal, row["task_id"], "approve" if approved else "reject") is None:
+                    return
                 reason = data.get("reason", "")
-                ok, msg = core.resolve_approval(approval_id, user_id=user_id, approved=approved, reason=reason)
+                ok, msg = core.resolve_approval(approval_id, user_id=principal.id, approved=approved, reason=reason, principal=principal)
                 if ok:
                     self._send_json(200, {"approval_id": approval_id, "resolved": True})
                 else:

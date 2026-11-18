@@ -90,11 +90,10 @@ class AccessControlEngine:
             return True, None
 
         task_owner = task.get("user_id")
-        project_id = task.get("project_id", "")
 
         # Viewing or getting report
         if action in ("view", "report", "status"):
-            if task_owner == user.id or "*" in user.allowed_projects or project_id in user.allowed_projects:
+            if task_owner == user.id:
                 return True, None
             return False, f"User '{user.id}' cannot view tasks of other users."
 

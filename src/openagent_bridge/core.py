@@ -89,15 +89,15 @@ class BridgeCore:
         return True, task_id, None
 
     def cancel_task(
-        self, task_id: str, user_id: str, reason: str = "User requested cancellation"
+        self, task_id: str, user_id: str, reason: str = "User requested cancellation", *, principal: User | None = None
     ) -> tuple[bool, str]:
         """Cancel a pending or running task after checking permissions."""
         task = self.db.get_task(task_id)
         if not task:
             return False, f"Task '{task_id}' not found."
 
-        channel = task.get("source_channel", "cli")
-        user = self.acl.authenticate(channel, user_id)
+        channel = "http" if principal is not None else task.get("source_channel", "cli")
+        user = principal or self.acl.authenticate(channel, user_id)
         if not user:
             return False, f"Unauthorized: sender '{user_id}' cannot cancel tasks."
 
@@ -116,14 +116,14 @@ class BridgeCore:
             return True, f"Task '{task_id}' cancelled successfully."
         return False, f"Task '{task_id}' could not be cancelled (current status: {task.get('status')})."
 
-    def get_task_report(self, task_id: str, user_id: str) -> dict[str, Any] | None:
+    def get_task_report(self, task_id: str, user_id: str, *, principal: User | None = None) -> dict[str, Any] | None:
         """Fetch status and verification results for a task."""
         task = self.db.get_task(task_id)
         if not task:
             return None
 
-        channel = task.get("source_channel", "cli")
-        user = self.acl.authenticate(channel, user_id)
+        channel = "http" if principal is not None else task.get("source_channel", "cli")
+        user = principal or self.acl.authenticate(channel, user_id)
         if not user:
             return None
 
@@ -147,7 +147,7 @@ class BridgeCore:
         }
 
     def resolve_approval(
-        self, approval_id: str, user_id: str, approved: bool, reason: str = ""
+        self, approval_id: str, user_id: str, approved: bool, reason: str = "", *, principal: User | None = None
     ) -> tuple[bool, str]:
         """Resolve a human approval request."""
         cur = self.db.connection.execute(
@@ -160,9 +160,9 @@ class BridgeCore:
         approval = dict(row)
         task_id = approval.get("task_id", "")
         task = self.db.get_task(task_id) or {}
-        channel = task.get("source_channel", "cli")
+        channel = "http" if principal is not None else task.get("source_channel", "cli")
 
-        user = self.acl.authenticate(channel, user_id)
+        user = principal or self.acl.authenticate(channel, user_id)
         if not user:
             return False, "Unauthorized sender."
 
@@ -176,10 +176,10 @@ class BridgeCore:
             return True, f"Approval '{approval_id}' resolved: {decision.upper()}."
         return False, f"Failed to resolve approval '{approval_id}'."
 
-    def get_projects(self, user_id: str) -> list[dict[str, Any]]:
+    def get_projects(self, user_id: str, *, principal: User | None = None) -> list[dict[str, Any]]:
         """Return projects accessible to the given user."""
         all_projects = self.db.list_projects()
-        user = self.acl.authenticate("cli", user_id)
+        user = principal or self.acl.authenticate("cli", user_id)
         if not user:
             return []
         if user.role == "admin" or "*" in user.allowed_projects:
