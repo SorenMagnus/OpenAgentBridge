@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -12,6 +13,8 @@ from openagent_bridge.channels.http_channel import HTTPChannelAdapter
 from openagent_bridge.cli import main
 from openagent_bridge.config import AuthConfig, BridgeConfig
 from openagent_bridge.core import BridgeCore
+from openagent_bridge.models import CommandSpec
+from openagent_bridge.worker import Worker
 
 
 _OWNER = {"Authorization": "Bearer owner-token"}
@@ -66,6 +69,75 @@ def delivery(tmp_path):
     finally:
         adapter.stop()
         core.db.close()
+
+
+@pytest.mark.parametrize("autonomy", [False, True])
+def test_worker_publishes_required_files_for_review(delivery, tmp_path, monkeypatch, autonomy):
+    core, task_id, _, base = delivery
+    worktree = tmp_path / "worktree"
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Tester", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"],
+        cwd=worktree, check=True, capture_output=True,
+    )
+    payload = bytes(range(256)) * 300
+    (worktree / "result.blend").write_bytes(payload)
+    (worktree / "oversize.bin").write_bytes(payload + b"!")
+    core.config.autonomy.enabled = autonomy
+    core.config.channels.http.max_artifact_bytes = len(payload)
+    core.db.connection.execute(
+        "UPDATE tasks SET acceptance = ? WHERE id = ?",
+        (json.dumps({"required_files": ["oversize.bin", "result.blend"]}), task_id),
+    )
+    core.db.connection.commit()
+    core.db.transition_task(task_id, "QUEUED")
+    monkeypatch.setattr("openagent_bridge.worker.CodexAdapter.detect", lambda self: True)
+    monkeypatch.setattr(
+        "openagent_bridge.worker.CodexAdapter.build_command",
+        lambda self, prompt, worktree, sandbox_mode: CommandSpec(
+            [sys.executable, "-c", "pass"], cwd=worktree, timeout_seconds=10,
+        ),
+    )
+
+    worker = Worker(core.config, db=core.db)
+    assert worker.run_once()["status"] == "REVIEW_REQUIRED"
+
+    collection = f"{base}/{task_id}/artifacts"
+    with fetch(collection) as response:
+        artifact, = json.load(response)["items"]
+    assert artifact["filename"] == "result.blend"
+    with fetch(f"{collection}/{artifact['id']}") as response:
+        assert response.read() == payload
+    events = core.db.get_events(task_id)
+    assert [event["type"] for event in events if event["type"].startswith("artifact.")] == [
+        "artifact.publish_failed", "artifact.published",
+    ]
+    assert core.db.get_task(task_id)["status"] == "REVIEW_REQUIRED"
+
+
+def test_worker_backfills_review_artifacts_once_per_snapshot(delivery, tmp_path):
+    core, task_id, _, base = delivery
+    output = tmp_path / "worktree" / "result.bin"
+    output.write_bytes(b"first version")
+    with core.db.connection:
+        core.db.connection.execute(
+            "UPDATE tasks SET status = 'REVIEW_REQUIRED', acceptance = ? WHERE id = ?",
+            (json.dumps({"required_files": ["result.bin", "result.bin", "missing.bin"]}), task_id),
+        )
+
+    collection = f"{base}/{task_id}/artifacts"
+    with fetch(collection) as response:
+        assert json.load(response)["items"] == []
+    assert Worker(core.config, db=core.db).run_once() is None
+    assert Worker(core.config, db=core.db).run_once() is None
+    with fetch(collection) as response:
+        artifact, = json.load(response)["items"]
+    assert artifact["sha256"] == hashlib.sha256(b"first version").hexdigest()
+    assert len(list(delivery_root(core.config).glob("*/*"))) == 1
+    events = core.db.get_events(task_id)
+    assert sum(event["type"] == "artifact.published" for event in events) == 1
+    assert any(event["type"] == "artifact.publish_failed" for event in events)
+    assert core.db.get_task(task_id)["status"] == "REVIEW_REQUIRED"
 
 
 @pytest.mark.parametrize("extension", ["png", "glb", "mp4", "zip"])

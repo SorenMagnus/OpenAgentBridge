@@ -2,16 +2,21 @@
 
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
+import sqlite3
 import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+from openagent_bridge.models import TaskStatus
+
 CHUNK = 64 * 1024
+logger = logging.getLogger(__name__)
 
 
 def delivery_root(config):
@@ -42,8 +47,8 @@ def _contained_path(root, path):
         return False
 
 
-def register_artifact(db, config, task_id, source):
-    """Publish a snapshot of a regular file inside the task worktree."""
+def register_artifact(db, config, task_id, source, *, auto_publish=False):
+    """Publish a worktree file. Automatic publication skips identical snapshots."""
     task = db.get_task(task_id)
     if task is None:
         raise ValueError("Unknown task")
@@ -92,17 +97,66 @@ def register_artifact(db, config, task_id, source):
             "identity": _file_identity(destination.stat()),
         }
         with db.connection:
+            if auto_publish:
+                db.connection.execute("BEGIN IMMEDIATE")
+                existing = db.connection.execute(
+                    "SELECT 1 FROM artifacts WHERE task_id = ? AND kind = 'delivery' "
+                    "AND json_extract(metadata, '$.filename') = ? "
+                    "AND json_extract(metadata, '$.sha256') = ? LIMIT 1",
+                    (task_id, metadata["filename"], metadata["sha256"]),
+                ).fetchone()
+                if existing:
+                    destination.unlink()
+                    return None
             db.connection.execute(
                 "INSERT INTO artifacts(id, task_id, kind, path, created_at, metadata) "
                 "VALUES (?, ?, 'delivery', ?, ?, ?)",
                 (artifact_id, task_id, destination.relative_to(root).as_posix(), datetime.now(timezone.utc).isoformat(),
                  json.dumps(metadata)),
             )
+            if auto_publish:
+                db.insert_event({
+                    "task_id": task_id, "type": "artifact.published", "source": "artifacts",
+                    "payload": {"artifact_id": artifact_id, "filename": metadata["filename"],
+                                "sha256": metadata["sha256"]},
+                })
     except BaseException:
         if created:
             destination.unlink(missing_ok=True)
         raise
     return artifact_id
+
+
+def publish_required_artifacts(db, config, task):
+    """Publish the required files of a task that is ready for review."""
+    if task is None or task["status"] != TaskStatus.REVIEW_REQUIRED.value:
+        return
+    acceptance = task.get("acceptance")
+    if isinstance(acceptance, str):
+        try:
+            acceptance = json.loads(acceptance)
+        except ValueError:
+            return
+    required_files = acceptance.get("required_files", []) if isinstance(acceptance, dict) else []
+    if not isinstance(required_files, list):
+        return
+
+    task_id = task["id"]
+    worktree = task.get("worktree_path")
+    for filename in required_files:
+        try:
+            if not worktree or not isinstance(filename, str) or not filename:
+                raise ValueError("Required artifact must name a file in the task worktree")
+            register_artifact(db, config, task_id, Path(worktree) / filename, auto_publish=True)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            try:
+                db.insert_event({
+                    "task_id": task_id, "type": "artifact.publish_failed", "source": "artifacts",
+                    "severity": "warning", "payload": {"filename": filename, "reason": reason},
+                })
+            except sqlite3.Error:
+                logger.exception("Could not log artifact publication failure for task %s", task_id)
 
 
 def byte_range(header, size):

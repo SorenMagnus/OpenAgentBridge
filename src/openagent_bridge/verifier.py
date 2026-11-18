@@ -6,6 +6,9 @@ agent text claims cannot override actual test outcomes.
 
 from __future__ import annotations
 
+import json
+import os
+import shlex
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -24,6 +27,38 @@ from openagent_bridge.runner import CommandRunner
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _command_argv(command: Any) -> list[str]:
+    if isinstance(command, dict):
+        command = command.get("command") or command.get("argv")
+    if isinstance(command, str):
+        if os.name == "nt" and command.strip():
+            import ctypes
+            from ctypes import wintypes
+
+            shell = ctypes.WinDLL("shell32", use_last_error=True)
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            split = shell.CommandLineToArgvW
+            split.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int))
+            split.restype = ctypes.POINTER(wintypes.LPWSTR)
+            kernel.LocalFree.argtypes = (wintypes.HLOCAL,)
+            kernel.LocalFree.restype = wintypes.HLOCAL
+            count = ctypes.c_int()
+            args = split("openagent " + command, ctypes.byref(count))
+            if not args:
+                raise ValueError("Invalid Windows command line")
+            try:
+                command = args[1:count.value]
+            finally:
+                kernel.LocalFree(ctypes.cast(args, wintypes.HLOCAL))
+        else:
+            command = shlex.split(command)
+    if (not isinstance(command, (list, tuple)) or not command
+            or not all(isinstance(arg, str) and "\0" not in arg for arg in command)
+            or not command[0]):
+        raise ValueError("Expected a nonempty command or argument list")
+    return list(command)
 
 
 class Verifier:
@@ -71,26 +106,19 @@ class Verifier:
 
         acceptance = task.get("acceptance", {})
         if isinstance(acceptance, str):
-            import json
             try:
                 acceptance = json.loads(acceptance)
-            except Exception:
-                acceptance = {}
+            except ValueError:
+                return EvaluationReport(task_id, run_id, base_commit, head_commit,
+                                        critical_failures=["invalid_acceptance"])
 
         if isinstance(acceptance, list):
-            normalized_cmds = []
-            for item in acceptance:
-                if isinstance(item, dict):
-                    cmd_val = item.get("command") or item.get("argv")
-                    if cmd_val:
-                        normalized_cmds.append(cmd_val)
-                    else:
-                        normalized_cmds.append(item)
-                else:
-                    normalized_cmds.append(item)
-            acceptance = {"commands": normalized_cmds}
-        elif not isinstance(acceptance, dict):
+            acceptance = {"commands": acceptance}
+        elif acceptance is None:
             acceptance = {}
+        elif not isinstance(acceptance, dict):
+            return EvaluationReport(task_id, run_id, base_commit, head_commit,
+                                    critical_failures=["invalid_acceptance"])
 
         forbidden_patterns = acceptance.get("forbidden_paths", [])
         forbidden_violations = self.policy.check_forbidden_paths(changed_files, forbidden_patterns)
@@ -162,20 +190,28 @@ class Verifier:
             )
 
         # 3. Run acceptance commands
-        commands = acceptance.get("commands", [])
+        commands = []
+        for field in ("commands", "checks"):
+            entries = acceptance.get(field, [])
+            if not isinstance(entries, (list, tuple)):
+                critical_failures.append(f"invalid_acceptance_{field}")
+                continue
+            commands.extend(entries)
         for idx, cmd in enumerate(commands):
             if deadline is not None and time.monotonic() >= deadline:
                 critical_failures.append("verification_deadline")
                 break
-            # cmd can be a list of strings (argv)
-            if isinstance(cmd, str):
-                import shlex
-                import sys
-                argv = shlex.split(cmd, posix=(sys.platform != "win32"))
-            else:
-                argv = list(cmd)
-
-            if not argv:
+            try:
+                argv = _command_argv(cmd)
+            except ValueError as exc:
+                check_name = f"command_{idx}"
+                critical_failures.append(check_name)
+                now = _utcnow()
+                checks.append(VerificationResult(
+                    check_name=check_name, kind="command", argv=[], start_time=now,
+                    end_time=now, duration_ms=0, exit_code=1, passed=False,
+                    metric={"error": str(exc)},
+                ))
                 continue
 
             # Check for dangerous commands in acceptance specs

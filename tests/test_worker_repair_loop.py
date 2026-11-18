@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -198,6 +199,36 @@ def test_worker_repair_loop_fixes_on_first_call(tmp_path: Path, monkeypatch: pyt
     assert result["overall_pass"] is True
     assert result.get("iterations_run") == 1
     assert mock_agent.call_count == 1
+
+
+@pytest.mark.parametrize(("exit_code", "max_iterations", "status"), [
+    (3, 1, "FAILED"),
+    (3, 4, "FAILED"),
+    (0, 4, "REVIEW_REQUIRED"),
+])
+def test_worker_runs_structured_command_checks(tmp_path, monkeypatch, exit_code, max_iterations, status):
+    _, _, db, worker = _create_env(tmp_path)
+    monkeypatch.setattr("openagent_bridge.worker.CodexAdapter", lambda: ScriptableMockAgent(fix_on_call=99))
+    executable = subprocess.list2cmdline([sys.executable]) if sys.platform == "win32" else shlex.quote(sys.executable)
+    task_id = worker.queue.enqueue({
+        "project_id": "test_proj",
+        "goal": "Run the supplied acceptance check",
+        "executor": {},
+        "budget": {"max_iterations": max_iterations},
+        "acceptance": {"checks": [{"kind": "command", "command": f'{executable} -c "raise SystemExit({exit_code})"'}]},
+    })
+
+    result = worker.run_once()
+
+    assert result["status"] == status
+    assert db.get_task(task_id)["status"] == status
+    checks = [check for check in db.get_verification_results(task_id) if check["kind"] == "command"]
+    assert checks
+    assert {check["exit_code"] for check in checks} == {exit_code}
+    if exit_code:
+        assert all(event["type"] != "repair.succeeded" for event in db.get_events(task_id))
+    if exit_code and max_iterations > 1:
+        assert any(event["type"] == "repair.stalled" for event in db.get_events(task_id))
 
 
 @pytest.mark.parametrize(("admin_cap", "task_cap", "invocations"), [(1, 99, 1), (5, 0, 0)])

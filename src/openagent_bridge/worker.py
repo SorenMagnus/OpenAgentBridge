@@ -15,6 +15,7 @@ from typing import Any
 from openagent_bridge.adapters.base import AgentAdapter
 from openagent_bridge.adapters.claude_code import ClaudeCodeAdapter
 from openagent_bridge.adapters.codex import CodexAdapter, is_quota_blocked
+from openagent_bridge.artifacts import publish_required_artifacts
 from openagent_bridge.budget import BudgetLimits, BudgetTracker
 from openagent_bridge.task_prompt import TaskPromptRenderer
 from openagent_bridge.config import BridgeConfig
@@ -51,6 +52,7 @@ class Worker:
         self.verifier = Verifier()
         self.router = router
         self._stop_requested = threading.Event()
+        self._artifact_backfill_done = False
 
     def is_kill_switched(self) -> bool:
         """Check if STOP file exists in data_dir."""
@@ -61,6 +63,13 @@ class Worker:
         """Attempt to claim and process exactly one task from the queue."""
         if self._stop_requested.is_set():
             return None
+        if not self._artifact_backfill_done:
+            task_ids = self.db.connection.execute(
+                "SELECT id FROM tasks WHERE status = ?", (TaskStatus.REVIEW_REQUIRED.value,),
+            ).fetchall()
+            for row in task_ids:
+                publish_required_artifacts(self.db, self.config, self.db.get_task(row["id"]))
+            self._artifact_backfill_done = True
         if self.is_kill_switched():
             logger.info("Kill switch active — skipping task claim.")
             return None
@@ -184,7 +193,6 @@ class Worker:
         codex = CodexAdapter()
         claude = ClaudeCodeAdapter()
         adapter = None
-        agent_name = "unknown"
 
         if codex.detect():
             adapter = codex
@@ -193,33 +201,32 @@ class Worker:
             adapter = claude
             agent_name = "claude-code"
 
-        run_id = str(uuid.uuid4())
-        exit_code = 0
-        stdout_path = None
-        stderr_path = None
+        if adapter is None or worktree_path is None or not worktree_path.is_dir():
+            reason = "No agent available" if adapter is None else "Task worktree unavailable"
+            self.db.transition_task(task_id, TaskStatus.FAILED.value, {"type": "task.failed", "reason": reason})
+            return {"task_id": task_id, "status": TaskStatus.FAILED.value, "overall_pass": False}
 
-        if adapter and worktree_path and worktree_path.exists():
-            if isinstance(adapter, AgentAdapter):
-                adapter.execution_deadline = tracker.deadline
-                adapter.probe_timeout_limit = self.config.runner.default_timeout_seconds
-            contract = TaskPromptRenderer.for_execution(
-                self.db.get_task(task_id) or task, limits,
-                data_dir=self.config.data_dir, repo_path=repo_root, worktree=worktree_path,
-                policy=asdict(self.config.policy),
-            )
-            cmd_spec = adapter.build_command(
-                prompt=contract,
-                worktree=worktree_path,
-                sandbox_mode="workspace-write",
-            )
-            if tracker.wall_exceeded:
-                return stop_for_budget("Agent deadline reached")
-            tracker.record_invocation()
-            tracker.sync_to_db(self.db, task_id)
-            run_res = self.runner.run(cmd_spec, deadline=tracker.deadline)
-            exit_code = run_res.exit_code
-            stdout_path = run_res.stdout_path
-            stderr_path = run_res.stderr_path
+        run_id = str(uuid.uuid4())
+        if isinstance(adapter, AgentAdapter):
+            adapter.execution_deadline = tracker.deadline
+            adapter.probe_timeout_limit = self.config.runner.default_timeout_seconds
+        contract = TaskPromptRenderer.for_execution(
+            self.db.get_task(task_id) or task, limits,
+            data_dir=self.config.data_dir, repo_path=repo_root, worktree=worktree_path,
+            policy=asdict(self.config.policy),
+        )
+        cmd_spec = adapter.build_command(
+            prompt=contract,
+            worktree=worktree_path,
+            sandbox_mode="workspace-write",
+        )
+        if tracker.wall_exceeded:
+            return stop_for_budget("Agent deadline reached")
+        tracker.record_invocation()
+        tracker.sync_to_db(self.db, task_id)
+        run_res = self.runner.run(cmd_spec, deadline=tracker.deadline)
+        stdout_path = run_res.stdout_path
+        stderr_path = run_res.stderr_path
 
         self.db.insert_run({
             "id": run_id,
@@ -228,14 +235,14 @@ class Worker:
             "agent": agent_name,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "ended_at": datetime.now(timezone.utc).isoformat(),
-            "exit_code": exit_code,
+            "exit_code": run_res.exit_code,
             "stdout_path": str(stdout_path) if stdout_path else "",
             "stderr_path": str(stderr_path) if stderr_path else "",
             **collect_telemetry(agent_name, stdout_path),
         })
 
         tracker.sync_to_db(self.db, task_id)
-        if stdout_path is not None and run_res.timed_out:
+        if run_res.timed_out:
             return stop_for_budget("Agent deadline reached")
 
         # Detect quota blockage
@@ -259,13 +266,8 @@ class Worker:
             )
             return {"task_id": task_id, "status": "BLOCKED", "reason": "quota_blocked"}
 
-        # Dispatch to AutonomousRepairLoop when autonomy is enabled
-        if (
-            self.config.autonomy.enabled
-            and adapter is not None
-            and worktree_path is not None
-            and worktree_path.exists()
-        ):
+        # A one-iteration task can verify the initial result and has no repair round.
+        if self.config.autonomy.enabled and tracker.limits.max_iterations > 1:
             return self._execute_with_repair_loop(task, worktree_path, adapter, tracker, contract)
 
         # Verification
@@ -311,6 +313,7 @@ class Worker:
                 final_status,
                 {"type": "task.review_required", "run_id": run_id},
             )
+            publish_required_artifacts(self.db, self.config, self.db.get_task(task_id))
         else:
             final_status = TaskStatus.FAILED.value
             self.db.transition_task(
@@ -357,6 +360,8 @@ class Worker:
                 tracker=tracker,
                 contract=contract,
             )
+            if result.final_status == TaskStatus.REVIEW_REQUIRED.value:
+                publish_required_artifacts(self.db, self.config, self.db.get_task(task_id))
 
             if self.router:
                 updated_task = self.db.get_task(task_id) or task

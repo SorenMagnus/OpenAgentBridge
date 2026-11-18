@@ -218,7 +218,7 @@ class AutonomousRepairLoop:
                     f"Stalled: identical failure signature repeated "
                     f"{progress['identical_rounds']} consecutive times with no progress"
                 )
-                final_status = TaskStatus.REVIEW_REQUIRED.value
+                final_status = TaskStatus.FAILED.value
                 self.db.transition_task(
                     task_id,
                     final_status,

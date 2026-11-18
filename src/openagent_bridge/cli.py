@@ -114,6 +114,7 @@ def cmd_task_submit(args: argparse.Namespace) -> int:
     """Submit a task from a JSON spec file."""
     from dataclasses import asdict
 
+    from openagent_bridge.artifacts import publish_required_artifacts
     from openagent_bridge.config import load_config
     from openagent_bridge.db import Database
     from openagent_bridge.models import TaskSpec, TaskStatus
@@ -351,6 +352,7 @@ def cmd_task_submit(args: argparse.Namespace) -> int:
     # i. Transition to REVIEW_REQUIRED
     if report.overall_pass:
         db.transition_task(task_id, TaskStatus.REVIEW_REQUIRED.value, {"type": "task.review_required"})
+        publish_required_artifacts(db, config, db.get_task(task_id))
         status_label = "REVIEW_REQUIRED"
     else:
         db.transition_task(task_id, TaskStatus.FAILED.value, {"type": "task.failed", "reason": "verification failed"})
