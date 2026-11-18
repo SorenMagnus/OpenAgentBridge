@@ -13,7 +13,7 @@ from typing import Any
 
 from openagent_bridge.adapters.base import AgentAdapter
 from openagent_bridge.adapters.claude_code import ClaudeCodeAdapter
-from openagent_bridge.adapters.codex import CodexAdapter
+from openagent_bridge.adapters.codex import CodexAdapter, is_quota_blocked
 from openagent_bridge.budget import BudgetLimits, BudgetTracker
 from openagent_bridge.db import Database
 from openagent_bridge.evaluator import ProgressEvaluator
@@ -279,6 +279,34 @@ class AutonomousRepairLoop:
                 "stdout_path": str(agent_result.stdout_path),
                 "stderr_path": str(agent_result.stderr_path),
             })
+
+            # Check for quota exhaustion / account limits
+            combined_output = ""
+            if agent_result.stdout_path and agent_result.stdout_path.exists():
+                try:
+                    combined_output += agent_result.stdout_path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+            if agent_result.stderr_path and agent_result.stderr_path.exists():
+                try:
+                    combined_output += "\n" + agent_result.stderr_path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+
+            if is_quota_blocked(combined_output):
+                stop_reason = "Codex quota blocked: account usage limit reached"
+                final_status = TaskStatus.BLOCKED.value
+                self.db.transition_task(
+                    task_id,
+                    final_status,
+                    {
+                        "type": "agent.quota_blocked",
+                        "iteration": iteration,
+                        "reason": stop_reason,
+                    },
+                )
+                logger.warning("Task %s stopped due to agent quota block: %s", task_id, stop_reason)
+                break
 
             # Commit any agent changes inside the task worktree
             try:

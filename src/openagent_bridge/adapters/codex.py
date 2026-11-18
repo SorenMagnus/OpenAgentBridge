@@ -12,6 +12,22 @@ from openagent_bridge.adapters.base import AgentAdapter
 from openagent_bridge.models import CommandSpec
 
 
+def is_quota_blocked(output: str) -> bool:
+    """Detect if Codex output indicates an account usage limit or quota exhaustion."""
+    if not output:
+        return False
+    lower = output.lower()
+    quota_signatures = [
+        "hit your usage limit",
+        "usage limit",
+        "purchase more credits",
+        "insufficient_quota",
+        "rate_limit_exceeded",
+        "upgrade to pro",
+    ]
+    return any(sig in lower for sig in quota_signatures)
+
+
 class CodexAdapter(AgentAdapter):
     """Adapter for executing tasks via OpenAI Codex CLI."""
 
@@ -63,6 +79,7 @@ class CodexAdapter(AgentAdapter):
                 caps["cd_support"] = "--cd" in txt or "-C" in txt
                 caps["ephemeral"] = "--ephemeral" in txt
                 caps["skip_git_repo_check"] = "--skip-git-repo-check" in txt
+                caps["approve_for_me"] = "--approve-for-me" in txt
                 if "workspace-write" in txt:
                     caps["sandbox_modes"].append("workspace-write")
                 if "read-only" in txt:
@@ -86,8 +103,11 @@ class CodexAdapter(AgentAdapter):
 
         argv = [self.binary_path, "exec"]
 
-        # Sandbox policy
-        if sandbox_mode in caps.get("sandbox_modes", ["workspace-write"]):
+        # In codex-cli, --sandbox and --approve-for-me are mutually exclusive.
+        # --approve-for-me automatically routes approvals via the workspace-write sandbox.
+        if caps.get("approve_for_me", False):
+            argv.append("--approve-for-me")
+        elif sandbox_mode in caps.get("sandbox_modes", ["workspace-write"]):
             argv.extend(["--sandbox", sandbox_mode])
         else:
             argv.extend(["--sandbox", "workspace-write"])

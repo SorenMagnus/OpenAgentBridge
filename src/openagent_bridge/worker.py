@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from openagent_bridge.adapters.claude_code import ClaudeCodeAdapter
-from openagent_bridge.adapters.codex import CodexAdapter
+from openagent_bridge.adapters.codex import CodexAdapter, is_quota_blocked
 from openagent_bridge.config import BridgeConfig
 from openagent_bridge.db import Database
 from openagent_bridge.models import CommandSpec, TaskStatus
@@ -153,6 +153,27 @@ class Worker:
             "stdout_path": str(stdout_path) if stdout_path else "",
             "stderr_path": str(stderr_path) if stderr_path else "",
         })
+
+        # Detect quota blockage
+        combined_output = ""
+        if stdout_path and stdout_path.exists():
+            try:
+                combined_output += stdout_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        if stderr_path and stderr_path.exists():
+            try:
+                combined_output += "\n" + stderr_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+        if is_quota_blocked(combined_output):
+            self.db.transition_task(
+                task_id,
+                TaskStatus.BLOCKED.value,
+                {"type": "task.blocked", "reason": "Codex quota blocked: account usage limit reached"},
+            )
+            return {"task_id": task_id, "status": "BLOCKED", "reason": "quota_blocked"}
 
         # Verification
         self.db.transition_task(

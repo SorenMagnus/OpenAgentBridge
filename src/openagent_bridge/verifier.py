@@ -66,6 +66,21 @@ class Verifier:
             except Exception:
                 acceptance = {}
 
+        if isinstance(acceptance, list):
+            normalized_cmds = []
+            for item in acceptance:
+                if isinstance(item, dict):
+                    cmd_val = item.get("command") or item.get("argv")
+                    if cmd_val:
+                        normalized_cmds.append(cmd_val)
+                    else:
+                        normalized_cmds.append(item)
+                else:
+                    normalized_cmds.append(item)
+            acceptance = {"commands": normalized_cmds}
+        elif not isinstance(acceptance, dict):
+            acceptance = {}
+
         forbidden_patterns = acceptance.get("forbidden_paths", [])
         forbidden_violations = self.policy.check_forbidden_paths(changed_files, forbidden_patterns)
 
@@ -141,7 +156,8 @@ class Verifier:
             # cmd can be a list of strings (argv)
             if isinstance(cmd, str):
                 import shlex
-                argv = shlex.split(cmd)
+                import sys
+                argv = shlex.split(cmd, posix=(sys.platform != "win32"))
             else:
                 argv = list(cmd)
 
