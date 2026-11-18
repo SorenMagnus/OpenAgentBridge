@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from openagent_bridge.channels.base import BaseChannelAdapter
 from openagent_bridge.models import UnifiedTaskRequest
@@ -78,6 +79,105 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
                     events = core.events.get_events(task_id)
                     self._send_json(200, {"task_id": task_id, "events": events})
                     return
+
+                # GET /api/v1/tasks/<id>/files/<relative_path>
+                if len(parts) >= 6 and parts[4] == "files":
+                    rel_segments = [unquote(p) for p in parts[5:]]
+                    if any(".." in seg for seg in parts[5:]) or any(".." in seg for seg in rel_segments):
+                        self._send_json(400, {"error": "Path traversal not allowed"})
+                        return
+
+                    rel_path_str = "/".join(rel_segments)
+                    if (
+                        rel_path_str.startswith("/")
+                        or rel_path_str.startswith("\\")
+                        or Path(rel_path_str).is_absolute()
+                        or bool(Path(rel_path_str).drive)
+                    ):
+                        self._send_json(400, {"error": "Absolute paths not allowed"})
+                        return
+
+                    task = core.db.get_task(task_id)
+                    if not task:
+                        self._send_json(404, {"error": "Task not found"})
+                        return
+
+                    worktree_raw = task.get("worktree_path")
+                    if not worktree_raw:
+                        self._send_json(404, {"error": "Task has no worktree"})
+                        return
+
+                    worktree_dir = Path(worktree_raw).resolve()
+                    if not worktree_dir.exists() or not worktree_dir.is_dir():
+                        self._send_json(404, {"error": "Worktree directory does not exist"})
+                        return
+
+                    target_path = (worktree_dir / rel_path_str).resolve()
+                    try:
+                        if not target_path.is_relative_to(worktree_dir):
+                            self._send_json(400, {"error": "Path outside worktree"})
+                            return
+                    except (ValueError, AttributeError):
+                        self._send_json(400, {"error": "Path outside worktree"})
+                        return
+
+                    if not target_path.is_file():
+                        self._send_json(404, {"error": "File not found"})
+                        return
+
+                    try:
+                        file_size = target_path.stat().st_size
+                    except OSError:
+                        self._send_json(404, {"error": "Cannot access file"})
+                        return
+
+                    max_size = 262144  # 256 KB
+                    if file_size > max_size:
+                        self._send_json(
+                            413,
+                            {
+                                "error": f"File size {file_size} exceeds limit of {max_size} bytes",
+                                "size": file_size,
+                                "limit": max_size,
+                            },
+                        )
+                        return
+
+                    try:
+                        raw_bytes = target_path.read_bytes()
+                    except OSError:
+                        self._send_json(500, {"error": "Failed to read file"})
+                        return
+
+                    if len(raw_bytes) > max_size:
+                        self._send_json(
+                            413,
+                            {
+                                "error": f"File size {len(raw_bytes)} exceeds limit of {max_size} bytes",
+                                "size": len(raw_bytes),
+                                "limit": max_size,
+                            },
+                        )
+                        return
+
+                    try:
+                        content = raw_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        self._send_json(415, {"error": "Binary files not supported; UTF-8 decode failed"})
+                        return
+
+                    self._send_json(
+                        200,
+                        {
+                            "task_id": task_id,
+                            "path": str(target_path.relative_to(worktree_dir)).replace("\\", "/"),
+                            "size": len(raw_bytes),
+                            "encoding": "utf-8",
+                            "content": content,
+                        },
+                    )
+                    return
+
                 task = core.db.get_task(task_id)
                 if task:
                     self._send_json(200, task)
