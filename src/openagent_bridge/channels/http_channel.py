@@ -25,6 +25,7 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
         def _send_json(self, status_code: int, data: Any):
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "private, no-store")
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(json.dumps(data).encode("utf-8"))

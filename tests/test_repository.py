@@ -22,7 +22,7 @@ def _init_git_repo(path: Path) -> None:
 
 
 def test_check_repo_clean(tmp_path: Path):
-    repo_path = tmp_path / "my_repo"
+    repo_path = tmp_path / "repo_\u9879\u76ee"
     _init_git_repo(repo_path)
 
     mgr = RepositoryManager()
@@ -32,7 +32,8 @@ def test_check_repo_clean(tmp_path: Path):
     assert info.head_sha != ""
 
 
-def test_check_not_a_repo(tmp_path: Path):
+def test_check_not_a_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
     mgr = RepositoryManager()
     with pytest.raises(RepositoryError):
         mgr.check_repo(tmp_path)

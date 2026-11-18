@@ -6,6 +6,7 @@ agent text claims cannot override actual test outcomes.
 
 from __future__ import annotations
 
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ class Verifier:
         task: dict[str, Any],
         worktree_path: Path,
         runner: CommandRunner,
+        deadline: float | None = None,
     ) -> EvaluationReport:
         """Run all acceptance criteria checks in the task worktree.
 
@@ -53,7 +55,16 @@ class Verifier:
         run_id = str(task.get("current_run_id", ""))
 
         # 1. Fetch current diff and check for forbidden paths
-        diff_info = self.repo_mgr.get_diff(worktree_path)
+        try:
+            diff_info = self.repo_mgr.get_diff(
+                worktree_path, deadline=deadline,
+                base_commit=task.get("base_commit") or "", include_worktree=True,
+            )
+        except subprocess.TimeoutExpired:
+            return EvaluationReport(
+                task_id, run_id, "", "", critical_failures=["verification_deadline"],
+                suggested_next_action="review",
+            )
         base_commit = diff_info.base_sha
         head_commit = diff_info.head_sha
         changed_files = diff_info.changed_files
@@ -153,6 +164,9 @@ class Verifier:
         # 3. Run acceptance commands
         commands = acceptance.get("commands", [])
         for idx, cmd in enumerate(commands):
+            if deadline is not None and time.monotonic() >= deadline:
+                critical_failures.append("verification_deadline")
+                break
             # cmd can be a list of strings (argv)
             if isinstance(cmd, str):
                 import shlex
@@ -193,7 +207,7 @@ class Verifier:
                 capture_output=True,
             )
 
-            result = runner.run(spec)
+            result = runner.run(spec, deadline=deadline) if deadline is not None else runner.run(spec)
             end_dt = _utcnow()
             duration_ms = int((time.monotonic() - start_mono) * 1000)
 

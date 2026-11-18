@@ -195,6 +195,7 @@ def serve_artifact(handler, core, task, parts):
         handler.send_header("Content-Type", metadata["content_type"])
         filename = quote(metadata["filename"], safe="", errors="replace")
         handler.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + filename)
+        handler.send_header("Cache-Control", "private, no-store")
         handler.send_header("X-Content-Type-Options", "nosniff")
         handler.send_header("Accept-Ranges", "bytes")
         handler.send_header("ETag", '"' + metadata["sha256"] + '"')

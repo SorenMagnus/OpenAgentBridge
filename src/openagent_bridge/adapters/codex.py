@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -61,26 +60,14 @@ class CodexAdapter(AgentAdapter):
         }
 
         try:
-            ver_res = subprocess.run(
-                [self.binary_path, "--version"],
-                capture_output=True,
-                text=True,
-                shell=False,
-                timeout=5,
-            )
+            ver_res = self._probe([self.binary_path, "--version"], timeout=5)
             if ver_res.returncode == 0:
                 caps["version"] = ver_res.stdout.strip()
         except Exception:
             pass
 
         try:
-            help_res = subprocess.run(
-                [self.binary_path, "exec", "--help"],
-                capture_output=True,
-                text=True,
-                shell=False,
-                timeout=10,
-            )
+            help_res = self._probe([self.binary_path, "exec", "--help"], timeout=10)
             if help_res.returncode == 0:
                 txt = help_res.stdout
                 caps["jsonl_output"] = "--json" in txt
