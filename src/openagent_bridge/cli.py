@@ -267,6 +267,19 @@ def cmd_task_submit(args: argparse.Namespace) -> int:
     )
     run_result = runner.run(cmd_spec)
 
+    run_id = str(uuid.uuid4())
+    db.insert_run({
+        "id": run_id,
+        "task_id": task_id,
+        "iteration": 1,
+        "agent": agent_name,
+        "started_at": _utcnow(),
+        "ended_at": _utcnow(),
+        "exit_code": run_result.exit_code,
+        "stdout_path": str(run_result.stdout_path),
+        "stderr_path": str(run_result.stderr_path),
+    })
+
     # g. Run verification checks
     db.transition_task(task_id, TaskStatus.VERIFYING.value, {"type": "task.verifying"})
     verifier = Verifier()
@@ -281,7 +294,7 @@ def cmd_task_submit(args: argparse.Namespace) -> int:
         db.insert_verification_result({
             "id": str(uuid.uuid4()),
             "task_id": task_id,
-            "run_id": "",
+            "run_id": run_id,
             "check_name": check.check_name,
             "kind": check.kind,
             "argv": check.argv,
@@ -387,6 +400,14 @@ def cmd_task_report(args: argparse.Namespace) -> int:
         for run in runs:
             print(f"    [{run.get('agent', '?')}] exit_code={run.get('exit_code', '?')} "
                   f"stdout={run.get('stdout_path', 'N/A')} stderr={run.get('stderr_path', 'N/A')}")
+
+    # Show verification results
+    vr_list = db.get_verification_results(args.task_id)
+    if vr_list:
+        print(f"  Verification Results ({len(vr_list)}):")
+        for vr in vr_list:
+            status = "PASS" if vr.get("passed") else "FAIL"
+            print(f"    [{status}] {vr.get('check_name')} (exit_code={vr.get('exit_code')}, duration={vr.get('duration_ms')}ms)")
 
     return 0
 

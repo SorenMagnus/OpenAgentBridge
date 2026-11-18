@@ -27,6 +27,17 @@ def _gen_id() -> str:
     return str(uuid.uuid4())
 
 
+def _to_str(val: Any) -> Any:
+    """Safely convert Path or datetime to string for SQLite storage."""
+    if val is None:
+        return None
+    if isinstance(val, Path):
+        return str(val)
+    if hasattr(val, "isoformat"):
+        return val.isoformat()
+    return val
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -390,12 +401,12 @@ class Database:
                     run.get("task_id"),
                     run.get("iteration"),
                     run.get("agent"),
-                    run.get("started_at"),
-                    run.get("ended_at"),
+                    _to_str(run.get("started_at")),
+                    _to_str(run.get("ended_at")),
                     run.get("exit_code"),
-                    run.get("stdout_path"),
-                    run.get("stderr_path"),
-                    run.get("agent_events_path"),
+                    _to_str(run.get("stdout_path")),
+                    _to_str(run.get("stderr_path")),
+                    _to_str(run.get("agent_events_path")),
                 ),
             )
             self._conn.commit()
@@ -461,13 +472,13 @@ class Database:
                     result.get("check_name"),
                     result.get("kind"),
                     argv,
-                    result.get("start_time"),
-                    result.get("end_time"),
+                    _to_str(result.get("start_time")),
+                    _to_str(result.get("end_time")),
                     result.get("duration_ms"),
                     result.get("exit_code"),
                     1 if result.get("passed") else 0,
-                    result.get("stdout_artifact"),
-                    result.get("stderr_artifact"),
+                    _to_str(result.get("stdout_artifact")),
+                    _to_str(result.get("stderr_artifact")),
                     metric,
                 ),
             )

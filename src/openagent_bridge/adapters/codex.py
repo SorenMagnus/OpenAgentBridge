@@ -62,6 +62,7 @@ class CodexAdapter(AgentAdapter):
                 caps["jsonl_output"] = "--json" in txt
                 caps["cd_support"] = "--cd" in txt or "-C" in txt
                 caps["ephemeral"] = "--ephemeral" in txt
+                caps["skip_git_repo_check"] = "--skip-git-repo-check" in txt
                 if "workspace-write" in txt:
                     caps["sandbox_modes"].append("workspace-write")
                 if "read-only" in txt:
@@ -102,6 +103,10 @@ class CodexAdapter(AgentAdapter):
         # Ephemeral session to avoid polluting global state
         if caps.get("ephemeral", True):
             argv.append("--ephemeral")
+
+        # Allow running inside worktree / detached repository
+        if caps.get("skip_git_repo_check", True):
+            argv.append("--skip-git-repo-check")
 
         # Instructions / prompt
         argv.append(prompt)

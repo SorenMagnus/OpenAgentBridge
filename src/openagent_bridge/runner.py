@@ -122,6 +122,7 @@ class CommandRunner:
                 cmd_spec.argv,
                 cwd=str(cmd_spec.cwd) if cmd_spec.cwd else None,
                 env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 shell=False,

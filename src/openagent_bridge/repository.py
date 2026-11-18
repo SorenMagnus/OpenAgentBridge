@@ -174,15 +174,30 @@ class RepositoryManager:
         worktree_path = data_dir / "worktrees" / task_id
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Create branch from HEAD and set up worktree in one command.
+        # Prune any stale worktree registrations first
+        _run_git("worktree", "prune", cwd=repo_root, check=False)
+
+        # Check if branch exists
+        branch_check = _run_git("rev-parse", "--verify", branch_name, cwd=repo_root, check=False)
+        branch_exists = (branch_check.returncode == 0)
+
+        # Create worktree (with new or existing branch)
         try:
-            _run_git(
-                "worktree", "add",
-                "-b", branch_name,
-                str(worktree_path),
-                "HEAD",
-                cwd=repo_root,
-            )
+            if branch_exists:
+                _run_git(
+                    "worktree", "add", "--force",
+                    str(worktree_path),
+                    branch_name,
+                    cwd=repo_root,
+                )
+            else:
+                _run_git(
+                    "worktree", "add",
+                    "-b", branch_name,
+                    str(worktree_path),
+                    "HEAD",
+                    cwd=repo_root,
+                )
         except subprocess.CalledProcessError as exc:
             raise RepositoryError(
                 f"Failed to create worktree: {exc.stderr}"

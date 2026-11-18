@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.1",
+  "task_id": "sample-task-001",
+  "idempotency_key": "fixture-task-idempotent-key-001",
+  "project_id": "sample-project",
+  "goal": "Verify the test_app.py passes testing suite",
+  "original_goal": "Verify the test_app.py passes testing suite",
+  "non_goals": ["Do not rewrite tests"],
+  "constraints": ["Keep tests passing"],
+  "acceptance": {
+    "commands": [["python", "-m", "pytest", "test_app.py", "-q"]],
+    "required_files": ["test_app.py"],
+    "forbidden_paths": [".env*"]
+  },
+  "executor": {"preferred": "codex", "fallback": "claude-code"},
+  "budget": {"max_iterations": 2, "max_wall_minutes": 10, "max_agent_invocations": 3},
+  "permissions": {"filesystem": "task_worktree", "network": "deny_by_default", "merge": "human_approval", "deploy": "forbidden"}
+}
