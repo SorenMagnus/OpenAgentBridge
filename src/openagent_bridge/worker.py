@@ -2,26 +2,30 @@
 
 from __future__ import annotations
 
-import json
 import logging
+import sqlite3
+import subprocess
 import threading
-import time
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from openagent_bridge.adapters.base import AgentAdapter
 from openagent_bridge.adapters.claude_code import ClaudeCodeAdapter
 from openagent_bridge.adapters.codex import CodexAdapter, is_quota_blocked
-from openagent_bridge.budget import BudgetLimits
+from openagent_bridge.budget import BudgetLimits, BudgetTracker
+from openagent_bridge.task_prompt import TaskPromptRenderer
 from openagent_bridge.config import BridgeConfig
 from openagent_bridge.db import Database
-from openagent_bridge.models import CommandSpec, TaskStatus
+from openagent_bridge.models import TaskStatus
 from openagent_bridge.queue import TaskQueue
-from openagent_bridge.recovery import TaskRecovery
+from openagent_bridge.recovery import RECOVERABLE_STATUSES, TaskRecovery
 from openagent_bridge.repair import AutonomousRepairLoop
 from openagent_bridge.repository import RepositoryManager
 from openagent_bridge.runner import CommandRunner
+from openagent_bridge.telemetry import collect_telemetry
 from openagent_bridge.verifier import Verifier
 
 logger = logging.getLogger("openagent_bridge.worker")
@@ -46,7 +50,7 @@ class Worker:
         self.runner = CommandRunner(config=config)
         self.verifier = Verifier()
         self.router = router
-        self._stop_requested = False
+        self._stop_requested = threading.Event()
 
     def is_kill_switched(self) -> bool:
         """Check if STOP file exists in data_dir."""
@@ -55,15 +59,20 @@ class Worker:
 
     def run_once(self) -> dict[str, Any] | None:
         """Attempt to claim and process exactly one task from the queue."""
+        if self._stop_requested.is_set():
+            return None
         if self.is_kill_switched():
             logger.info("Kill switch active — skipping task claim.")
             return None
 
         # Check and recover any expired tasks first
         self.recovery.recover_all()
+        if self._stop_requested.is_set():
+            return None
 
         lease_seconds = self.config.worker.lease_seconds
-        task = self.queue.claim(self.worker_id, lease_seconds=lease_seconds)
+        owner = f'{self.worker_id}:{uuid.uuid4().hex}'
+        task = self.queue.claim(owner, lease_seconds=lease_seconds)
         if not task:
             return None
 
@@ -75,49 +84,77 @@ class Worker:
         heartbeat_interval = self.config.worker.heartbeat_seconds
 
         def _heartbeat_loop():
-            while not heartbeat_stop.wait(timeout=heartbeat_interval):
-                renewed = self.queue.heartbeat(
-                    task_id, self.worker_id, lease_seconds=lease_seconds
-                )
-                if not renewed:
-                    logger.warning("Heartbeat renewal failed for task %s", task_id)
-                    break
+            heartbeat_db = Database(self.db.db_path)
+            try:
+                queue = TaskQueue(heartbeat_db)
+                while not heartbeat_stop.wait(timeout=heartbeat_interval):
+                    try:
+                        renewed = queue.heartbeat(task_id, owner, lease_seconds=lease_seconds)
+                    except sqlite3.OperationalError:
+                        logger.warning("Heartbeat database busy for task %s", task_id, exc_info=True)
+                        continue
+                    if not renewed:
+                        logger.warning("Lease expired or released for task %s", task_id)
+                        break
+            finally:
+                heartbeat_db.close()
 
         hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
         hb_thread.start()
 
         try:
-            result = self._execute_task(task)
-            return result
+            with self.db.guard_worker_lease(task_id, owner):
+                return self._execute_task(task)
         finally:
             heartbeat_stop.set()
-            hb_thread.join(timeout=2.0)
-            self.queue.release(task_id, self.worker_id)
+            hb_thread.join()
+            current = self.db.get_task(task_id)
+            if current and current["status"] not in RECOVERABLE_STATUSES:
+                self.queue.release(task_id, owner)
 
     def _execute_task(self, task: dict[str, Any]) -> dict[str, Any]:
         """Run execution lifecycle for a claimed task."""
         task_id = task["id"]
+        limits = self._repair_budget_limits(task)
+        tracker = BudgetTracker.resume(limits, self.db, task_id)
+
+        def stop_for_budget(reason: str) -> dict[str, Any]:
+            tracker.sync_to_db(self.db, task_id)
+            self.db.transition_task(
+                task_id, TaskStatus.BUDGET_EXCEEDED.value,
+                {"type": "task.budget_exceeded", "reason": reason},
+            )
+            return {"task_id": task_id, "status": TaskStatus.BUDGET_EXCEEDED.value, "reason": reason}
+
+        exceeded, reason = tracker.is_exceeded()
+        if exceeded:
+            return stop_for_budget(reason)
+
         worktree_path_str = task.get("worktree_path")
         worktree_path = Path(worktree_path_str) if worktree_path_str else None
+        project = self.db.get_project(task.get("project_id", ""))
+        repo_root = Path(project["path"]) if project and project.get("path") else None
 
         # Automatically initialize worktree if missing (e.g. tasks submitted via HTTP / Bot)
         if not worktree_path or not worktree_path.exists():
-            project_id = task.get("project_id", "")
-            project = self.db.get_project(project_id)
-            if project and project.get("path"):
-                repo_root = Path(project["path"])
+            if repo_root is not None:
                 try:
+                    repo_info = self.repo_mgr.check_repo(repo_root, deadline=tracker.deadline)
                     worktree_path = self.repo_mgr.create_worktree(
                         repo_root=repo_root,
                         task_id=task_id,
                         data_dir=self.config.data_dir,
+                        deadline=tracker.deadline,
                     )
                     self.db.connection.execute(
-                        "UPDATE tasks SET worktree_path = ?, branch = ? WHERE id = ?",
-                        (str(worktree_path), f"openagent/{task_id}", task_id),
+                        "UPDATE tasks SET worktree_path = ?, branch = ?, base_commit = ? WHERE id = ?",
+                        (str(worktree_path), f"openagent/{task_id}", repo_info.head_sha, task_id),
                     )
                     self.db.connection.commit()
+                    task = self.db.get_task(task_id) or task
                     logger.info("Initialized worktree for task %s at %s", task_id, worktree_path)
+                except subprocess.TimeoutExpired:
+                    return stop_for_budget("Worktree preparation deadline reached")
                 except Exception as exc:
                     logger.exception("Failed to initialize worktree for task %s: %s", task_id, exc)
                     self.db.transition_task(
@@ -162,12 +199,24 @@ class Worker:
         stderr_path = None
 
         if adapter and worktree_path and worktree_path.exists():
+            if isinstance(adapter, AgentAdapter):
+                adapter.execution_deadline = tracker.deadline
+                adapter.probe_timeout_limit = self.config.runner.default_timeout_seconds
+            contract = TaskPromptRenderer.for_execution(
+                self.db.get_task(task_id) or task, limits,
+                data_dir=self.config.data_dir, repo_path=repo_root, worktree=worktree_path,
+                policy=asdict(self.config.policy),
+            )
             cmd_spec = adapter.build_command(
-                prompt=task.get("goal", ""),
+                prompt=contract,
                 worktree=worktree_path,
                 sandbox_mode="workspace-write",
             )
-            run_res = self.runner.run(cmd_spec)
+            if tracker.wall_exceeded:
+                return stop_for_budget("Agent deadline reached")
+            tracker.record_invocation()
+            tracker.sync_to_db(self.db, task_id)
+            run_res = self.runner.run(cmd_spec, deadline=tracker.deadline)
             exit_code = run_res.exit_code
             stdout_path = run_res.stdout_path
             stderr_path = run_res.stderr_path
@@ -182,7 +231,12 @@ class Worker:
             "exit_code": exit_code,
             "stdout_path": str(stdout_path) if stdout_path else "",
             "stderr_path": str(stderr_path) if stderr_path else "",
+            **collect_telemetry(agent_name, stdout_path),
         })
+
+        tracker.sync_to_db(self.db, task_id)
+        if stdout_path is not None and run_res.timed_out:
+            return stop_for_budget("Agent deadline reached")
 
         # Detect quota blockage
         combined_output = ""
@@ -212,7 +266,7 @@ class Worker:
             and worktree_path is not None
             and worktree_path.exists()
         ):
-            return self._execute_with_repair_loop(task, worktree_path, adapter)
+            return self._execute_with_repair_loop(task, worktree_path, adapter, tracker, contract)
 
         # Verification
         self.db.transition_task(
@@ -223,7 +277,11 @@ class Worker:
 
         report = None
         if worktree_path and worktree_path.exists():
-            report = self.verifier.run_checks(task, worktree_path, self.runner)
+            if tracker.wall_exceeded:
+                return stop_for_budget("Verification deadline reached")
+            tracker.record_iteration()
+            tracker.sync_to_db(self.db, task_id)
+            report = self.verifier.run_checks(task, worktree_path, self.runner, deadline=tracker.deadline)
             for check in report.checks:
                 self.db.insert_verification_result({
                     "id": str(uuid.uuid4()),
@@ -242,6 +300,9 @@ class Worker:
                     "metric": check.metric,
                 })
 
+        tracker.sync_to_db(self.db, task_id)
+        if tracker.wall_exceeded:
+            return stop_for_budget("Verification deadline reached")
         overall_pass = report.overall_pass if report else False
         if overall_pass:
             final_status = TaskStatus.REVIEW_REQUIRED.value
@@ -269,53 +330,32 @@ class Worker:
 
     def _repair_budget_limits(self, task: dict[str, Any]) -> BudgetLimits:
         """Derive BudgetLimits from task's budget field and config defaults."""
-        budget_raw = task.get("budget", {})
-        if isinstance(budget_raw, str):
-            try:
-                budget = json.loads(budget_raw)
-            except Exception:
-                budget = {}
-        elif isinstance(budget_raw, dict):
-            budget = budget_raw
-        else:
-            budget = {}
-
-        autonomy_cfg = self.config.autonomy
-        max_iterations = budget.get("max_iterations") or autonomy_cfg.max_iterations
-        max_wall_minutes = budget.get("max_wall_minutes") or autonomy_cfg.max_wall_minutes
-        max_agent_invocations = (
-            budget.get("max_agent_invocations") or autonomy_cfg.max_agent_invocations
-        )
-        stop_after_no_improvement = autonomy_cfg.stop_after_no_improvement
-
-        return BudgetLimits(
-            max_iterations=int(max_iterations),
-            max_wall_minutes=int(max_wall_minutes),
-            max_agent_invocations=int(max_agent_invocations),
-            stop_after_no_improvement=int(stop_after_no_improvement),
-        )
+        return BudgetLimits.for_task(task, self.config.autonomy)
 
     def _execute_with_repair_loop(
         self,
         task: dict[str, Any],
         worktree_path: Path,
         adapter: Any,
+        tracker: BudgetTracker,
+        contract: str,
     ) -> dict[str, Any]:
         """Execute autonomous repair loop for the task."""
         task_id = str(task["id"])
-        budget_limits = self._repair_budget_limits(task)
 
         try:
             loop = AutonomousRepairLoop(
                 db=self.db,
                 runner=self.runner,
                 verifier=self.verifier,
-                budget_limits=budget_limits,
+                budget_limits=tracker.limits,
             )
             result = loop.run_loop(
                 task=task,
                 worktree_path=worktree_path,
                 adapter=adapter,
+                tracker=tracker,
+                contract=contract,
             )
 
             if self.router:
@@ -352,15 +392,15 @@ class Worker:
     def run_forever(self, poll_interval: float = 2.0) -> None:
         """Run worker loop indefinitely until stopped."""
         logger.info("Starting OpenAgent worker %s", self.worker_id)
-        while not self._stop_requested:
+        while not self._stop_requested.is_set():
             try:
                 processed = self.run_once()
                 if not processed:
-                    time.sleep(poll_interval)
+                    self._stop_requested.wait(poll_interval)
             except Exception as exc:
                 logger.error("Error in worker loop: %s", exc, exc_info=True)
-                time.sleep(poll_interval)
+                self._stop_requested.wait(poll_interval)
 
     def stop(self) -> None:
         """Signal worker to stop gracefully."""
-        self._stop_requested = True
+        self._stop_requested.set()

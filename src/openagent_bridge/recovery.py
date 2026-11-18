@@ -6,8 +6,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from openagent_bridge.db import Database, InvalidTransitionError
+from openagent_bridge.db import Database
 from openagent_bridge.models import TaskStatus
+
+
+RECOVERABLE_STATUSES = (
+    TaskStatus.PREPARING.value,
+    TaskStatus.RUNNING.value,
+    TaskStatus.VERIFYING.value,
+    TaskStatus.REPAIR_PLANNED.value,
+)
 
 
 def _utcnow_iso() -> str:
@@ -27,15 +35,12 @@ class TaskRecovery:
         cur = self.db.connection.execute(
             """
             SELECT * FROM tasks
-            WHERE status IN (?, ?, ?)
+            WHERE status IN (?, ?, ?, ?)
               AND (lease_until IS NOT NULL AND lease_until < ?)
             ORDER BY created_at ASC
             """,
             (
-                TaskStatus.PREPARING.value,
-                TaskStatus.RUNNING.value,
-                TaskStatus.VERIFYING.value,
-                now_str,
+                *RECOVERABLE_STATUSES, now_str,
             ),
         )
         return [dict(r) for r in cur.fetchall()]
@@ -45,75 +50,46 @@ class TaskRecovery:
 
         Returns the new status (QUEUED or FAILED).
         """
-        task = self.db.get_task(task_id)
-        if not task:
-            return "NOT_FOUND"
-
-        old_status = task["status"].upper()
-        old_owner = task.get("lease_owner")
-        old_lease = task.get("lease_until")
-
-        # 1. Transition to RECOVERING
-        try:
-            self.db.transition_task(
-                task_id,
-                TaskStatus.RECOVERING.value,
-                {
-                    "type": "task.recovery_started",
-                    "reason": "lease_expired",
-                    "previous_status": old_status,
-                    "previous_owner": old_owner,
-                    "previous_lease_until": old_lease,
-                },
-            )
-        except InvalidTransitionError:
-            pass
-
-        # 2. Check worktree viability
-        worktree_path_str = task.get("worktree_path")
-        worktree_viable = False
-        if worktree_path_str:
-            wt_path = Path(worktree_path_str)
-            worktree_viable = wt_path.exists() and (wt_path / ".git").exists()
-
-        # 3. Check retry iteration count
-        iteration = task.get("iteration") or 0
-        max_iterations = task.get("max_iterations") or 5
-
         conn = self.db.connection
-        # Release old lease
-        conn.execute(
-            "UPDATE tasks SET lease_owner = NULL, lease_until = NULL, heartbeat_at = NULL WHERE id = ?",
-            (task_id,),
-        )
-        conn.commit()
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            task = self.db.get_task(task_id)
+            if task is None:
+                return "NOT_FOUND"
+            lease = task["lease_until"]
+            if task["status"] not in RECOVERABLE_STATUSES or lease is None or lease >= _utcnow_iso():
+                return "SKIPPED"
 
-        # 4. Decide next action: requeue or fail
-        if iteration < max_iterations:
-            # Requeue for retry
-            new_status = TaskStatus.QUEUED.value
-            self.db.transition_task(
-                task_id,
-                new_status,
-                {
-                    "type": "task.recovered",
-                    "action": "requeued",
-                    "worktree_viable": worktree_viable,
-                    "iteration": iteration,
-                },
+            self.db._transition_task(task_id, TaskStatus.RECOVERING.value, {
+                "type": "task.recovery_started",
+                "reason": "lease_expired",
+                "previous_status": task["status"],
+                "previous_owner": task["lease_owner"],
+                "previous_lease_until": lease,
+            })
+            conn.execute(
+                "UPDATE tasks SET lease_owner = NULL, lease_until = NULL, heartbeat_at = NULL WHERE id = ?",
+                (task_id,),
             )
-        else:
-            new_status = TaskStatus.FAILED.value
-            self.db.transition_task(
-                task_id,
-                new_status,
-                {
+            iteration = task.get("iteration") or 0
+            max_iterations = task.get("max_iterations") or 5
+            if iteration >= max_iterations:
+                target = TaskStatus.FAILED.value
+                event = {
                     "type": "task.recovery_failed",
                     "reason": "max_iterations_reached_during_recovery",
-                },
-            )
-
-        return new_status
+                }
+            else:
+                target = TaskStatus.QUEUED.value
+                worktree = task.get("worktree_path")
+                event = {
+                    "type": "task.recovered",
+                    "action": "requeued",
+                    "worktree_viable": bool(worktree and (Path(worktree) / ".git").exists()),
+                    "iteration": iteration,
+                }
+            self.db._transition_task(task_id, target, event)
+            return target
 
     def recover_all(self) -> list[dict[str, Any]]:
         """Recover all in-flight tasks with expired leases."""
@@ -122,5 +98,6 @@ class TaskRecovery:
         for t in expired:
             task_id = t["id"]
             new_status = self.recover_task(task_id)
-            results.append({"task_id": task_id, "recovered_status": new_status})
+            if new_status not in ("SKIPPED", "NOT_FOUND"):
+                results.append({"task_id": task_id, "recovered_status": new_status})
         return results

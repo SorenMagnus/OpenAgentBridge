@@ -22,7 +22,7 @@ def _init_git_repo(path: Path) -> None:
 
 
 def test_check_repo_clean(tmp_path: Path):
-    repo_path = tmp_path / "my_repo"
+    repo_path = tmp_path / "repo_\u9879\u76ee"
     _init_git_repo(repo_path)
 
     mgr = RepositoryManager()
@@ -32,7 +32,8 @@ def test_check_repo_clean(tmp_path: Path):
     assert info.head_sha != ""
 
 
-def test_check_not_a_repo(tmp_path: Path):
+def test_check_not_a_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
     mgr = RepositoryManager()
     with pytest.raises(RepositoryError):
         mgr.check_repo(tmp_path)
@@ -106,3 +107,29 @@ def test_worktree_with_spaces_in_path(tmp_path: Path):
 
     mgr.remove_worktree(worktree)
     assert not worktree.exists()
+
+
+def test_merge_requires_approval_for_current_result(tmp_path):
+    from openagent_bridge.approvals import ApprovalGate
+    from openagent_bridge.db import Database
+    from openagent_bridge.merge import merge_task
+
+    root = tmp_path / "repo"
+    _init_git_repo(root)
+    target = RepositoryManager.check_repo(root).branch
+    task_id = "review"
+    tree = RepositoryManager.create_worktree(root, task_id, tmp_path / "data")
+    db = Database(tmp_path / "test.db")
+    db.register_project("example", str(root))
+    db.insert_task({"id": task_id, "status": "SUCCEEDED", "project_id": "example",
+                    "worktree_path": str(tree)})
+    gate = ApprovalGate(db)
+    plan = merge_task(db, task_id, target, request=True)
+    assert gate.resolve(plan["approval_id"], "approved")
+    subprocess.run(["git", "commit", "--allow-empty", "-m", "updated result"], cwd=tree, check=True)
+    with pytest.raises(RepositoryError, match="Approval required"):
+        merge_task(db, task_id, target, execute=True)
+    updated = merge_task(db, task_id, target, request=True)
+    assert gate.resolve(updated["approval_id"], "approved")
+    assert merge_task(db, task_id, target, execute=True)["merged"]
+    assert RepositoryManager.check_repo(root).head_sha == updated["result"]

@@ -23,6 +23,7 @@ dev = [
 
 [project.scripts]
 openagent = "openagent_bridge.cli:main"
+openagent-merge = "openagent_bridge.merge:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/openagent_bridge"]

@@ -13,7 +13,7 @@ data_dir: ~/.openagent  # default: ~/.openagent
 # Worker pool
 # ---------------------------------------------------------------------------
 worker:
-  concurrency: 2            # max parallel tasks
+  concurrency: 1            # max parallel tasks (1 or 2)
   heartbeat_seconds: 30     # interval between heartbeats (s)
   lease_seconds: 300        # how long a lease is valid (s)
 

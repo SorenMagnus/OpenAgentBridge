@@ -15,7 +15,7 @@ from openagent_bridge.core import BridgeCore
 
 @pytest.fixture
 def http_setup(tmp_path: Path):
-    port = 19123
+    port = 0
     config = BridgeConfig(
         data_dir=tmp_path / "data",
         auth=AuthConfig(
@@ -34,7 +34,7 @@ def http_setup(tmp_path: Path):
     core.register_channel_adapter(adapter)
     adapter.start()
 
-    yield core, adapter, f"http://127.0.0.1:{port}"
+    yield core, adapter, f"http://127.0.0.1:{adapter.server.server_port}"
 
     adapter.stop()
 
@@ -147,3 +147,81 @@ def test_http_channel_approval_resolution(http_setup):
         res_data = json.loads(resp.read().decode("utf-8"))
         assert resp.status == 200
         assert res_data["resolved"] is True
+
+@pytest.mark.parametrize("suffix", ["", "/events", "/report", "/files/sample.txt", "/artifacts"])
+def test_task_read_requires_ownership(http_setup, suffix):
+    core, _, base_url = http_setup
+    task_id = core.db.insert_task({"project_id": "sample_proj", "user_id": "another"})
+    for prefix in ("/tasks/", "/api/v1/tasks/"):
+        request = urllib.request.Request(
+            base_url + prefix + task_id + suffix,
+            headers={"Authorization": "Bearer secret_token_123"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            urllib.request.urlopen(request)
+        assert denied.value.code == 404
+
+
+def test_unmapped_token_and_cross_channel_report(http_setup):
+    core, _, base_url = http_setup
+    task_id = core.db.insert_task({
+        "source_channel": "telegram", "user_id": "http:secret_token_123",
+        "project_id": "sample_proj", "goal": "cross-channel report",
+    })
+    url = f"{base_url}/api/v1/tasks/{task_id}/report"
+    core.config.auth.api_tokens.append("unmapped")
+    with pytest.raises(urllib.error.HTTPError) as denied:
+        urllib.request.urlopen(urllib.request.Request(url, headers={"X-API-Key": "unmapped"}))
+    assert denied.value.code == 401
+    request = urllib.request.Request(url, headers={"X-API-Key": "secret_token_123"})
+    with urllib.request.urlopen(request) as response:
+        assert json.load(response)["goal"] == "cross-channel report"
+
+
+def test_cross_user_writes_leave_task_and_approval_untouched(http_setup):
+    core, _, base_url = http_setup
+    task = core.db.insert_task({"source_channel": "cli", "user_id": "someone_else",
+                                "project_id": "sample_proj", "status": "QUEUED"})
+    approval = core.approval_gate.request(task, "merge")
+    for suffix, payload in [(f"/tasks/{task}/cancel", {}),
+                            (f"/api/v1/approvals/{approval}/resolve", {"approved": True})]:
+        req = urllib.request.Request(base_url + suffix, data=json.dumps(payload).encode(),
+                                     headers={"X-API-Key": "secret_token_123"})
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            urllib.request.urlopen(req)
+        assert denied.value.code == 404
+    assert core.db.get_task(task)["status"] == "QUEUED"
+    assert core.approval_gate.list_pending(task)[0]["id"] == approval
+
+
+def test_concurrent_http_retries_enqueue_once(http_setup):
+    from concurrent.futures import ThreadPoolExecutor
+
+    core, _, base_url = http_setup
+    def submit(_):
+        req = urllib.request.Request(
+            base_url + "/api/v1/tasks",
+            data=json.dumps({"project_id": "sample_proj", "goal": "retry",
+                             "idempotency_key": "concurrent"}).encode(),
+            headers={"X-API-Key": "secret_token_123"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.load(response)["task_id"]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        ids = set(pool.map(submit, range(12)))
+    assert len(ids) == 1
+    assert core.db.get_task(ids.pop())["status"] == "QUEUED"
+
+
+def test_mapped_token_records_stable_owner(http_setup):
+    from openagent_bridge.access_control import User
+
+    core, _, base_url = http_setup
+    core.config.auth.http_token_users = {"test-token": "operator"}
+    core.acl.add_user(User(id="operator", allowed_channels=["http"]))
+    req = urllib.request.Request(base_url + "/tasks", data=b'{"project_id":"sample_proj","goal":"sample"}',
+                                 headers={"X-API-Key": "test-token"})
+    with urllib.request.urlopen(req) as response:
+        task_id = json.load(response)["task_id"]
+    assert core.db.get_task(task_id)["user_id"] == "operator"

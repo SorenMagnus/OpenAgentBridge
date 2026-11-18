@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
+from threading import local
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,6 +98,8 @@ CREATE TABLE IF NOT EXISTS runs (
     stdout_path       TEXT,
     stderr_path       TEXT,
     agent_events_path TEXT,
+    model             TEXT,
+    usage             TEXT,       -- JSON
     FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
 
@@ -173,13 +177,13 @@ CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_id);
 # Duplicated here so the DB layer is self-contained; the authoritative set
 # lives in models.py.
 _VALID_TRANSITIONS: dict[str, set[str]] = {
-    "NEW":              {"VALIDATING", "PREPARING", "QUEUED", "RUNNING", "VERIFYING", "BLOCKED", "CANCELLED"},
+    "NEW":              {"VALIDATING", "PREPARING", "QUEUED", "RUNNING", "VERIFYING", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"},
     "VALIDATING":       {"QUEUED", "PREPARING", "FAILED", "BLOCKED", "CANCELLED"},
     "QUEUED":           {"PREPARING", "CANCELLED"},
-    "PREPARING":        {"RUNNING", "BLOCKED", "FAILED", "CANCELLED"},
+    "PREPARING":        {"RUNNING", "BLOCKED", "FAILED", "CANCELLED", "RECOVERING", "BUDGET_EXCEEDED"},
     "RUNNING":          {"VERIFYING", "FAILED", "BUDGET_EXCEEDED", "CANCELLED", "RECOVERING", "BLOCKED"},
-    "VERIFYING":        {"SUCCEEDED", "REPAIR_PLANNED", "REVIEW_REQUIRED", "FAILED", "BUDGET_EXCEEDED", "CANCELLED"},
-    "REPAIR_PLANNED":   {"RUNNING", "QUEUED", "FAILED", "CANCELLED", "BUDGET_EXCEEDED"},
+    "VERIFYING":        {"SUCCEEDED", "REPAIR_PLANNED", "REVIEW_REQUIRED", "FAILED", "BUDGET_EXCEEDED", "CANCELLED", "RECOVERING"},
+    "REPAIR_PLANNED":   {"RUNNING", "QUEUED", "FAILED", "CANCELLED", "BUDGET_EXCEEDED", "RECOVERING"},
     "REVIEW_REQUIRED":  {"SUCCEEDED", "REPAIR_PLANNED", "FAILED", "CANCELLED"},
     "RECOVERING":       {"QUEUED", "RUNNING", "PREPARING", "FAILED", "CANCELLED"},
     "BLOCKED":          {"QUEUED", "VALIDATING", "CANCELLED", "FAILED"},
@@ -203,27 +207,36 @@ class Database:
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
+        self._worker_lease = local()
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
-        # Automatic column migration for existing tables
-        cursor = self._conn.execute("PRAGMA table_info(tasks)")
-        existing_cols = {row["name"] for row in cursor.fetchall()}
-        if "user_id" not in existing_cols:
-            self._conn.execute("ALTER TABLE tasks ADD COLUMN user_id TEXT DEFAULT 'anonymous'")
-        if "source_channel" not in existing_cols:
-            self._conn.execute("ALTER TABLE tasks ADD COLUMN source_channel TEXT DEFAULT 'cli'")
-        if "reply_target" not in existing_cols:
-            self._conn.execute("ALTER TABLE tasks ADD COLUMN reply_target TEXT")
-        self._conn.commit()
+        # Serialize the columns check and migration across CLI and service processes.
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            task_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(tasks)")}
+            if "user_id" not in task_cols:
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN user_id TEXT DEFAULT 'anonymous'")
+            if "source_channel" not in task_cols:
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN source_channel TEXT DEFAULT 'cli'")
+            if "reply_target" not in task_cols:
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN reply_target TEXT")
+            run_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")}
+            for column in ("model", "usage"):
+                if column not in run_cols:
+                    self._conn.execute(f"ALTER TABLE runs ADD COLUMN {column} TEXT")
 
     # -- helpers -------------------------------------------------------------
 
     def close(self) -> None:
         self._conn.close()
+
+    @property
+    def db_path(self) -> Path:
+        return self._db_path
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -323,6 +336,16 @@ class Database:
         )
         return [dict(r) for r in cur.fetchall()]
 
+    @contextmanager
+    def guard_worker_lease(self, task_id: str, owner: str):
+        """Fence status transitions by the active claim while a worker executes."""
+        previous = getattr(self._worker_lease, "claim", None)
+        self._worker_lease.claim = (task_id, owner)
+        try:
+            yield
+        finally:
+            self._worker_lease.claim = previous
+
     def transition_task(
         self,
         task_id: str,
@@ -334,68 +357,76 @@ class Database:
         Raises ``InvalidTransitionError`` if the transition is not legal.
         Raises ``ValueError`` if the task does not exist.
         """
-        try:
-            cur = self._conn.execute(
-                "SELECT id, status FROM tasks WHERE id = ?", (task_id,)
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._transition_task(task_id, new_status, event_payload)
+
+    def _transition_task(
+        self,
+        task_id: str,
+        new_status: str,
+        event_payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a transition inside an existing write transaction."""
+        cur = self._conn.execute(
+            "SELECT id, status, lease_owner, lease_until FROM tasks WHERE id = ?", (task_id,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError(f"Task {task_id} not found")
+
+        now = _utcnow()
+        claim = getattr(self._worker_lease, "claim", None)
+        if claim and claim[0] == task_id and (
+            row["lease_owner"] != claim[1] or not row["lease_until"] or row["lease_until"] < now
+        ):
+            raise InvalidTransitionError(f"Worker {claim[1]} no longer holds the lease for task {task_id}")
+
+        current_status = str(row["status"]).upper()
+        target_status = str(new_status).upper()
+        allowed = _VALID_TRANSITIONS.get(current_status, set())
+        if target_status not in allowed:
+            raise InvalidTransitionError(
+                f"Cannot transition task {task_id} from "
+                f"{current_status!r} to {target_status!r}"
             )
-            row = cur.fetchone()
-            if row is None:
-                raise ValueError(f"Task {task_id} not found")
 
-            current_status = str(row["status"]).upper()
-            target_status = str(new_status).upper()
-            allowed = _VALID_TRANSITIONS.get(current_status, set())
-            if target_status not in allowed:
-                raise InvalidTransitionError(
-                    f"Cannot transition task {task_id} from "
-                    f"{current_status!r} to {target_status!r}"
-                )
+        self._conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+            (target_status, now, task_id),
+        )
 
-            now = _utcnow()
+        event_id = _gen_id()
+        # Determine next sequence number for this task.
+        seq_cur = self._conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE task_id = ?",
+            (task_id,),
+        )
+        next_seq = seq_cur.fetchone()[0]
 
-            self._conn.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                (target_status, now, task_id),
-            )
+        event_type = (event_payload or {}).get("type", "status_transition")
+        event_source = (event_payload or {}).get("source", "db")
+        event_severity = (event_payload or {}).get("severity", "INFO")
 
-            event_id = _gen_id()
-            # Determine next sequence number for this task.
-            seq_cur = self._conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE task_id = ?",
-                (task_id,),
-            )
-            next_seq = seq_cur.fetchone()[0]
-
-            event_type = (event_payload or {}).get("type", "status_transition")
-            event_source = (event_payload or {}).get("source", "db")
-            event_severity = (event_payload or {}).get("severity", "INFO")
-
-            payload = {
-                "from_status": current_status,
-                "to_status": target_status,
-                **(event_payload or {}),
-            }
-            self._conn.execute(
-                "INSERT INTO events (event_id, task_id, type, timestamp, sequence, source, severity, payload) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    event_id,
-                    task_id,
-                    event_type,
-                    now,
-                    next_seq,
-                    event_source,
-                    event_severity,
-                    json.dumps(payload),
-                ),
-            )
-            self._conn.commit()
-        except (InvalidTransitionError, ValueError):
-            self._conn.rollback()
-            raise
-        except Exception:
-            self._conn.rollback()
-            raise
+        payload = {
+            "from_status": current_status,
+            "to_status": target_status,
+            **(event_payload or {}),
+        }
+        self._conn.execute(
+            "INSERT INTO events (event_id, task_id, type, timestamp, sequence, source, severity, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                task_id,
+                event_type,
+                now,
+                next_seq,
+                event_source,
+                event_severity,
+                json.dumps(payload),
+            ),
+        )
 
     # -- events --------------------------------------------------------------
 
@@ -454,8 +485,8 @@ class Database:
         try:
             self._conn.execute(
                 "INSERT INTO runs (id, task_id, iteration, agent, started_at, ended_at, "
-                "exit_code, stdout_path, stderr_path, agent_events_path) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "exit_code, stdout_path, stderr_path, agent_events_path, model, usage) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     run.get("task_id"),
@@ -467,6 +498,8 @@ class Database:
                     _to_str(run.get("stdout_path")),
                     _to_str(run.get("stderr_path")),
                     _to_str(run.get("agent_events_path")),
+                    run.get("model"),
+                    json.dumps(run["usage"]) if run.get("usage") is not None else None,
                 ),
             )
             self._conn.commit()
@@ -482,11 +515,12 @@ class Database:
         values: list[Any] = []
         for col in (
             "task_id", "iteration", "agent", "started_at", "ended_at",
-            "exit_code", "stdout_path", "stderr_path", "agent_events_path",
+            "exit_code", "stdout_path", "stderr_path", "agent_events_path", "model", "usage",
         ):
             if col in run:
                 fields.append(f"{col} = ?")
-                values.append(run[col])
+                value = run[col]
+                values.append(json.dumps(value) if col == "usage" and value is not None else _to_str(value))
         if not fields:
             return
         values.append(run_id)
@@ -505,7 +539,11 @@ class Database:
             "SELECT * FROM runs WHERE task_id = ? ORDER BY iteration ASC",
             (task_id,),
         )
-        return [dict(r) for r in cur.fetchall()]
+        runs = [dict(row) for row in cur]
+        for run in runs:
+            if run["usage"] is not None:
+                run["usage"] = json.loads(run["usage"])
+        return runs
 
     # -- verification results ------------------------------------------------
 

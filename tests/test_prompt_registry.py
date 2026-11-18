@@ -1,6 +1,7 @@
 """Tests for PromptRegistry versioning, GoalSpec immutability, and promotion gates."""
 
 from pathlib import Path
+from openagent_bridge.prompt_evaluator import BenchmarkCase, evaluate_candidate
 from openagent_bridge.prompt_registry import GoalSpec, PromptRegistry, PromptTemplate
 
 
@@ -85,6 +86,20 @@ def test_prompt_versioning_and_promotion(tmp_path: Path):
     )
     assert eval_ok.eligible_for_promotion is True
     assert eval_ok.requires_human_approval is True
+
+    assert not registry.promote("coding_task", 2, "alice")
+    cases = [
+        BenchmarkCase(str(i), f"Case {i}", f"Goal {i}", ["ok"], is_holdout=i >= 15,
+                      critical=i == 0, security=i == 1)
+        for i in range(20)
+    ]
+    evaluation = evaluate_candidate(
+        registry, "coding_task", 2, cases,
+        lambda version, case_id, prompt: "ok" if version == 2 or case_id != "5" else "omitted",
+    )
+    assert evaluation.eligible_for_promotion
+    assert registry.get_champion("coding_task").version == 1
+    assert not registry.promote("coding_task", 2, "")
 
     # 4. Human promotion
     promoted = registry.promote("coding_task", version=2, approved_by="senior_engineer_alice")

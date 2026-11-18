@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +12,7 @@ from typing import Any
 import pytest
 
 from openagent_bridge.adapters.base import AgentAdapter
+from openagent_bridge.cli import cmd_task_submit
 from openagent_bridge.config import AutonomyConfig, BridgeConfig
 from openagent_bridge.db import Database
 from openagent_bridge.models import CommandSpec, TaskStatus
@@ -102,6 +105,9 @@ def test_worker_repair_loop_fixes_on_second_call(tmp_path: Path, monkeypatch: py
         "id": "task-loop-a",
         "project_id": "test_proj",
         "goal": "Fix solution.py so solve() returns True",
+        "budget": {"max_agent_invocations": 2},
+        "constraints": ["Keep the public function name"],
+        "non_goals": ["Do not change CI"],
         "acceptance": {
             "commands": [
                 [sys.executable, "-c", "import solution; assert solution.solve() is True"]
@@ -122,6 +128,13 @@ def test_worker_repair_loop_fixes_on_second_call(tmp_path: Path, monkeypatch: py
     second_prompt = mock_agent.prompts[1]
     assert "OBJECTIVE (IMMUTABLE)" in second_prompt
     assert "FAILING CHECKS" in second_prompt
+    assert second_prompt.startswith(mock_agent.prompts[0])
+    assert "Keep the public function name" in second_prompt
+    assert json.dumps(str(repo_dir), ensure_ascii=False)[1:-1] in second_prompt
+    usage = db.connection.execute(
+        "SELECT used_invocations FROM budgets WHERE task_id = ?", ("task-loop-a",),
+    ).fetchone()
+    assert usage["used_invocations"] == 2
 
     # Events in DB must record repair loop progression
     events = db.get_events("task-loop-a")
@@ -185,3 +198,46 @@ def test_worker_repair_loop_fixes_on_first_call(tmp_path: Path, monkeypatch: pyt
     assert result["overall_pass"] is True
     assert result.get("iterations_run") == 1
     assert mock_agent.call_count == 1
+
+
+@pytest.mark.parametrize(("admin_cap", "task_cap", "invocations"), [(1, 99, 1), (5, 0, 0)])
+def test_worker_enforces_smaller_invocation_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, admin_cap: int, task_cap: int, invocations: int,
+):
+    _, _, db, worker = _create_env(tmp_path)
+    worker.config.autonomy.max_agent_invocations = admin_cap
+    mock_agent = ScriptableMockAgent(fix_on_call=2)
+    monkeypatch.setattr("openagent_bridge.worker.CodexAdapter", lambda: mock_agent)
+    worker.queue.enqueue({
+        "id": "task-budget", "project_id": "test_proj", "goal": "Fix failing test",
+        "budget": {"max_agent_invocations": task_cap},
+        "acceptance": {"commands": [[sys.executable, "-c", "raise SystemExit(1)"]]},
+    })
+
+    assert worker.run_once()["status"] == TaskStatus.BUDGET_EXCEEDED.value
+    assert mock_agent.call_count == invocations
+    usage = db.connection.execute(
+        "SELECT max_agent_invocations, used_invocations FROM budgets WHERE task_id = ?",
+        ("task-budget",),
+    ).fetchone()
+    assert usage["max_agent_invocations"] == min(admin_cap, task_cap)
+    assert usage["used_invocations"] == invocations
+
+
+def test_synchronous_submit_enforces_zero_invocations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo, _, db, worker = _create_env(tmp_path)
+    monkeypatch.setattr("openagent_bridge.config.load_config", lambda _: worker.config)
+    mock_agent = ScriptableMockAgent()
+    monkeypatch.setattr("openagent_bridge.adapters.codex.CodexAdapter", lambda: mock_agent)
+    task_file = tmp_path / "task.json"
+    task_file.write_text(json.dumps({
+        "task_id": "cli-budget",
+        "idempotency_key": "cli-budget",
+        "project_id": "test_proj",
+        "goal": "Fix failing test",
+        "budget": {"max_agent_invocations": 0},
+    }), encoding="utf-8")
+
+    assert cmd_task_submit(argparse.Namespace(config=None, task_file=task_file, project=repo)) == 1
+    assert db.get_task("cli-budget")["status"] == TaskStatus.BUDGET_EXCEEDED.value
+    assert mock_agent.call_count == 0

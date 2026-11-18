@@ -126,3 +126,15 @@ def test_core_approvals_and_reports(core_instance: BridgeCore):
     assert report is not None
     assert report["task_id"] == task_id
     assert report["project_id"] == "proj_demo"
+
+
+def test_http_submission_retries_are_scoped_to_owner(core_instance):
+    core = core_instance
+    legacy = core.db.insert_task({"source_channel": "http", "user_id": "another",
+                                  "idempotency_key": "retry", "project_id": "proj_demo"})
+    request = UnifiedTaskRequest(project_id="proj_demo", user_goal="new task",
+                                 user_id="developer_1", source_channel="http", idempotency_key="retry")
+    ok, task_id, _ = core.submit_unified_task(request)
+    assert ok and task_id != legacy
+    assert core.submit_unified_task(request) == (True, task_id, None)
+    assert core.db.get_task(legacy)["status"] == "NEW"

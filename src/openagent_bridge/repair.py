@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import subprocess
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,9 +17,11 @@ from openagent_bridge.budget import BudgetLimits, BudgetTracker
 from openagent_bridge.db import Database
 from openagent_bridge.evaluator import ProgressEvaluator
 from openagent_bridge.models import CommandSpec, EvaluationReport, TaskStatus
+from openagent_bridge.task_prompt import TaskPromptRenderer
 from openagent_bridge.policy import Policy
 from openagent_bridge.repository import RepositoryManager
 from openagent_bridge.runner import CommandRunner
+from openagent_bridge.telemetry import collect_telemetry
 from openagent_bridge.verifier import Verifier
 
 logger = logging.getLogger("openagent_bridge.repair")
@@ -50,10 +51,9 @@ def build_repair_prompt(
     diff_stat: str,
 ) -> str:
     """Construct an immutable, structured repair prompt for the coding agent."""
-    lines = [
-        "You are tasked with fixing test/build failures in this repository.",
-        f"OBJECTIVE (IMMUTABLE): {original_goal}",
-    ]
+    lines = ["You are tasked with fixing test/build failures in this repository."]
+    if original_goal:
+        lines.append(f"OBJECTIVE (IMMUTABLE): {original_goal}")
 
     if constraints:
         lines.append("CONSTRAINTS:")
@@ -108,25 +108,16 @@ class AutonomousRepairLoop:
         task: dict[str, Any],
         worktree_path: Path,
         adapter: AgentAdapter | None = None,
+        tracker: BudgetTracker | None = None,
+        contract: str | None = None,
     ) -> RepairLoopResult:
         """Execute bounded autonomous repair loop."""
         worktree_path = Path(worktree_path)
         task_id = str(task["id"])
-        original_goal = str(task.get("original_goal") or task.get("goal", ""))
-        constraints = task.get("constraints", [])
-        if isinstance(constraints, str):
-            import json
-            try: constraints = json.loads(constraints)
-            except Exception: constraints = []
-        non_goals = task.get("non_goals", [])
-        if isinstance(non_goals, str):
-            import json
-            try: non_goals = json.loads(non_goals)
-            except Exception: non_goals = []
-
         # Initialize budget and progress tracker
-        tracker = BudgetTracker(self.budget_limits)
-        evaluator = ProgressEvaluator(stall_threshold=self.budget_limits.stop_after_no_improvement)
+        tracker = tracker or BudgetTracker.resume(BudgetLimits.for_task(task, self.budget_limits), self.db, task_id)
+        contract = contract or TaskPromptRenderer.render(task, tracker.limits, worktree=worktree_path)
+        evaluator = ProgressEvaluator(stall_threshold=tracker.limits.stop_after_no_improvement)
 
         # Select agent adapter
         if adapter is None:
@@ -147,9 +138,22 @@ class AutonomousRepairLoop:
 
         iteration = 0
 
+        def stop_for_budget(reason: str) -> str:
+            self.db.transition_task(
+                task_id,
+                TaskStatus.BUDGET_EXCEEDED.value,
+                {"type": "repair.budget_exceeded", "iteration": iteration, "reason": reason},
+            )
+            return TaskStatus.BUDGET_EXCEEDED.value
+
         while True:
-            iteration += 1
+            if tracker.wall_exceeded or tracker.usage.used_iterations >= tracker.limits.max_iterations:
+                _, stop_reason = tracker.is_exceeded()
+                stop_reason = f"Budget exceeded: {stop_reason}"
+                final_status = stop_for_budget(stop_reason)
+                break
             tracker.record_iteration()
+            iteration += 1
             tracker.sync_to_db(self.db, task_id)
 
             logger.info("Task %s starting repair iteration %d", task_id, iteration)
@@ -160,7 +164,7 @@ class AutonomousRepairLoop:
                 TaskStatus.VERIFYING.value,
                 {"type": "repair.verifying", "iteration": iteration},
             )
-            report = self.verifier.run_checks(task, worktree_path, self.runner)
+            report = self.verifier.run_checks(task, worktree_path, self.runner, deadline=tracker.deadline)
             reports.append(report)
 
             # Store verification results in DB
@@ -183,13 +187,18 @@ class AutonomousRepairLoop:
                     "metric": check.metric,
                 })
 
-            current_diff = self.repo_mgr.get_diff(worktree_path)
+            tracker.sync_to_db(self.db, task_id)
+            if tracker.wall_exceeded:
+                stop_reason = "Budget exceeded: verification deadline reached"
+                final_status = stop_for_budget(stop_reason)
+                break
+
             pass_count = sum(1 for c in report.checks if c.passed)
 
             # Track best commit
             if pass_count > best_pass_count:
                 best_pass_count = pass_count
-                best_head_sha = current_diff.head_sha
+                best_head_sha = report.head_commit
 
             # 2. Check success condition
             if report.overall_pass:
@@ -221,12 +230,17 @@ class AutonomousRepairLoop:
             exceeded, budget_reason = tracker.is_exceeded()
             if exceeded:
                 stop_reason = f"Budget exceeded: {budget_reason}"
-                final_status = TaskStatus.BUDGET_EXCEEDED.value
-                self.db.transition_task(
-                    task_id,
-                    final_status,
-                    {"type": "repair.budget_exceeded", "iteration": iteration, "reason": stop_reason},
+                final_status = stop_for_budget(stop_reason)
+                break
+
+            try:
+                current_diff = self.repo_mgr.get_diff(
+                    worktree_path, deadline=tracker.deadline,
+                    base_commit=task.get("base_commit") or "", include_worktree=True,
                 )
+            except subprocess.TimeoutExpired:
+                stop_reason = "Budget exceeded: diff deadline reached"
+                final_status = stop_for_budget(stop_reason)
                 break
 
             # 5. Build bounded repair prompt and invoke Agent
@@ -246,9 +260,9 @@ class AutonomousRepairLoop:
                         pass
 
             repair_prompt = build_repair_prompt(
-                original_goal=original_goal,
-                constraints=constraints,
-                non_goals=non_goals,
+                original_goal="",
+                constraints=[],
+                non_goals=[],
                 failing_checks=report.critical_failures,
                 error_summary="\n---\n".join(error_snippets),
                 diff_stat=current_diff.stat,
@@ -259,14 +273,20 @@ class AutonomousRepairLoop:
                 TaskStatus.RUNNING.value,
                 {"type": "repair.agent_running", "iteration": iteration},
             )
-            tracker.record_invocation()
-
+            if isinstance(adapter, AgentAdapter):
+                adapter.execution_deadline = tracker.deadline
             cmd_spec = adapter.build_command(
-                prompt=repair_prompt,
+                prompt=contract + "\n\n" + repair_prompt,
                 worktree=worktree_path,
                 sandbox_mode="workspace-write",
             )
-            agent_result = self.runner.run(cmd_spec)
+            if tracker.wall_exceeded:
+                stop_reason = "Budget exceeded: agent deadline reached"
+                final_status = stop_for_budget(stop_reason)
+                break
+            tracker.record_invocation()
+            tracker.sync_to_db(self.db, task_id)
+            agent_result = self.runner.run(cmd_spec, deadline=tracker.deadline)
 
             self.db.insert_run({
                 "id": run_id,
@@ -278,7 +298,15 @@ class AutonomousRepairLoop:
                 "exit_code": agent_result.exit_code,
                 "stdout_path": str(agent_result.stdout_path),
                 "stderr_path": str(agent_result.stderr_path),
+                **collect_telemetry(type(adapter).__name__, agent_result.stdout_path),
             })
+
+            tracker.sync_to_db(self.db, task_id)
+            if agent_result.timed_out:
+                stop_reason = "Agent invocation timed out"
+                final_status = TaskStatus.BUDGET_EXCEEDED.value
+                self.db.transition_task(task_id, final_status, {"type": "agent.timeout", "run_id": run_id})
+                break
 
             # Check for quota exhaustion / account limits
             combined_output = ""
@@ -308,23 +336,18 @@ class AutonomousRepairLoop:
                 logger.warning("Task %s stopped due to agent quota block: %s", task_id, stop_reason)
                 break
 
-            # Commit any agent changes inside the task worktree
-            try:
-                subprocess.run(
-                    ["git", "add", "-A"],
-                    cwd=str(worktree_path),
-                    capture_output=True,
-                    check=False,
-                )
-                subprocess.run(
-                    ["git", "commit", "-m", f"openagent auto-repair iteration {iteration}"],
-                    cwd=str(worktree_path),
-                    capture_output=True,
-                    check=False,
-                )
-            except Exception:
-                pass
+            # Commit agent changes within the same subprocess deadline.
+            for argv in (
+                ["git", "add", "-A"],
+                ["git", "commit", "-m", f"openagent auto-repair iteration {iteration}"],
+            ):
+                git_result = self.runner.run(CommandSpec(
+                    argv=argv, cwd=worktree_path, timeout_seconds=60,
+                ), deadline=tracker.deadline)
+                if git_result.exit_code != 0:
+                    break
 
+        tracker.sync_to_db(self.db, task_id)
         return RepairLoopResult(
             task_id=task_id,
             final_status=final_status,

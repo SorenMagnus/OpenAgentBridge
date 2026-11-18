@@ -1,7 +1,9 @@
 """Tests for CommandRunner process execution, timeouts, and secret redaction."""
 
 import sys
+import time
 from pathlib import Path
+from openagent_bridge.config import BridgeConfig, RunnerConfig
 from openagent_bridge.models import CommandSpec
 from openagent_bridge.runner import CommandRunner
 
@@ -88,3 +90,33 @@ def test_cwd_with_spaces(tmp_path: Path):
     result = runner.run(spec)
     assert result.exit_code == 0
     assert "A Folder With Spaces" in result.stdout_path.read_text(encoding="utf-8")
+
+
+def test_admin_timeout_terminates_descendants(tmp_path: Path):
+    config = BridgeConfig(data_dir=tmp_path, runner=RunnerConfig(default_timeout_seconds=1))
+    runner = CommandRunner(config=config)
+    grandchild = (
+        "from pathlib import Path; import time; "
+        "Path('ready').touch(); time.sleep(2); Path('survived').touch()"
+    )
+    child = f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {grandchild!r}])"
+    parent = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])"
+    result = runner.run(CommandSpec(argv=[sys.executable, "-c", parent], cwd=tmp_path, timeout_seconds=10))
+
+    assert result.timed_out
+    assert result.exit_code == 124
+    assert (tmp_path / "ready").exists()
+    assert result.duration_ms < 2000
+    time.sleep(1.5)
+    assert not (tmp_path / "survived").exists()
+
+
+def test_expired_task_deadline_prevents_launch(tmp_path: Path):
+    runner = CommandRunner(artifact_dir=tmp_path / "artifacts")
+    spec = CommandSpec(
+        argv=[sys.executable, "-c", "from pathlib import Path; Path('launched').touch()"],
+        cwd=tmp_path,
+        timeout_seconds=10,
+    )
+    assert runner.run(spec, deadline=time.monotonic() - 1).timed_out
+    assert not (tmp_path / "launched").exists()

@@ -16,7 +16,7 @@ from openagent_bridge.core import BridgeCore
 
 @pytest.fixture
 def http_task_files_setup(tmp_path: Path):
-    port = 19135
+    port = 0
     worktree_dir = tmp_path / "worktree"
     worktree_dir.mkdir(parents=True, exist_ok=True)
 
@@ -51,7 +51,7 @@ def http_task_files_setup(tmp_path: Path):
     core.register_channel_adapter(adapter)
     adapter.start()
 
-    yield core, adapter, f"http://127.0.0.1:{port}", task_id, worktree_dir
+    yield core, adapter, f"http://127.0.0.1:{adapter.server.server_port}", task_id, worktree_dir
 
     adapter.stop()
 

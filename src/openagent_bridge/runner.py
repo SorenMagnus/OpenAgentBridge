@@ -11,12 +11,11 @@ import logging
 import os
 import platform
 import subprocess
-import sys
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from openagent_bridge.logging_utils import SecretRedactor
 
@@ -60,7 +59,7 @@ class CommandRunner:
     artifact_dir:
         Root directory for stdout/stderr log files.
     kill_grace_seconds:
-        Seconds between SIGTERM/terminate and force-kill.
+        Maximum seconds to collect output after termination.
     max_log_bytes:
         Truncate stdout/stderr artifact files at this size.
     redactor:
@@ -87,13 +86,14 @@ class CommandRunner:
             self._artifact_dir = Path.home() / ".openagent" / "artifacts"
 
         self._artifact_dir.mkdir(parents=True, exist_ok=True)
+        self._timeout_cap = getattr(getattr(config, "runner", None), "default_timeout_seconds", None)
         self._kill_grace = kill_grace_seconds
         self._max_log_bytes = max_log_bytes
         self._redactor = redactor or SecretRedactor()
 
     # ----- public API -------------------------------------------------------
 
-    def run(self, cmd_spec: "CommandSpec") -> CommandResult:
+    def run(self, cmd_spec: "CommandSpec", *, deadline: float | None = None) -> CommandResult:
         """Run *cmd_spec* and return a :class:`CommandResult`.
 
         The subprocess is **always** launched with ``shell=False``.
@@ -106,68 +106,34 @@ class CommandRunner:
         if cmd_spec.env_overrides:
             env.update(cmd_spec.env_overrides)
 
-        # Build creation flags per platform.
-        kwargs: dict = {}
-        if _IS_WINDOWS:
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        else:
-            kwargs["start_new_session"] = True  # creates its own process group
-
         t0 = time.monotonic()
+        timeout = cmd_spec.timeout_seconds
+        if self._timeout_cap is not None:
+            timeout = min(timeout, self._timeout_cap)
+        command_deadline = t0 + timeout
+        if deadline is not None:
+            command_deadline = min(command_deadline, deadline)
+
         timed_out = False
-        error_message: str | None = None
-
+        error_message = None
         try:
-            proc = subprocess.Popen(
-                cmd_spec.argv,
-                cwd=str(cmd_spec.cwd) if cmd_spec.cwd else None,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-                **kwargs,
+            result = run_captured(
+                cmd_spec.argv, cwd=cmd_spec.cwd, env=env, deadline=command_deadline,
+                cleanup_timeout=min(1, max(0, self._kill_grace)),
             )
-        except FileNotFoundError as exc:
-            duration_ms = int((time.monotonic() - t0) * 1000)
-            error_message = f"Command not found: {exc}"
-            logger.error(error_message)
-            self._write_empty(stdout_path, stderr_path)
-            return CommandResult(
-                exit_code=127,
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                duration_ms=duration_ms,
-                timed_out=False,
-                error_message=error_message,
-            )
-        except PermissionError as exc:
-            duration_ms = int((time.monotonic() - t0) * 1000)
-            error_message = f"Permission denied: {exc}"
-            logger.error(error_message)
-            self._write_empty(stdout_path, stderr_path)
-            return CommandResult(
-                exit_code=126,
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                duration_ms=duration_ms,
-                timed_out=False,
-                error_message=error_message,
-            )
-
-        try:
-            raw_stdout, raw_stderr = proc.communicate(
-                timeout=cmd_spec.timeout_seconds
-            )
-        except subprocess.TimeoutExpired:
+            exit_code = result.returncode
+            raw_stdout, raw_stderr = result.stdout, result.stderr
+        except subprocess.TimeoutExpired as exc:
             timed_out = True
-            logger.warning(
-                "Timeout (%ds) expired for %s — terminating process tree",
-                cmd_spec.timeout_seconds,
-                cmd_spec.argv,
-            )
-            self._kill_tree(proc)
-            raw_stdout, raw_stderr = proc.communicate()
+            exit_code = 124
+            error_message = "Command deadline reached"
+            raw_stdout, raw_stderr = exc.output or b"", exc.stderr or b""
+            logger.warning("Command deadline reached for %s", cmd_spec.argv[0])
+        except OSError as exc:
+            exit_code = 127 if isinstance(exc, FileNotFoundError) else 126
+            error_message = str(exc)
+            raw_stdout = raw_stderr = b""
+            logger.error("Cannot run %s: %s", cmd_spec.argv[0], exc)
 
         duration_ms = int((time.monotonic() - t0) * 1000)
 
@@ -183,8 +149,6 @@ class CommandRunner:
         self._write_artifact(stdout_path, stdout_text)
         self._write_artifact(stderr_path, stderr_text)
 
-        exit_code = proc.returncode
-
         if exit_code != 0 and not timed_out:
             logger.info(
                 "Command %s exited with code %d", cmd_spec.argv, exit_code
@@ -198,57 +162,6 @@ class CommandRunner:
             timed_out=timed_out,
             error_message=error_message,
         )
-
-    # ----- process-tree kill ------------------------------------------------
-
-    def _kill_tree(self, proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
-        """Graceful terminate → wait → force kill of the entire process tree."""
-        try:
-            if _IS_WINDOWS:
-                self._kill_tree_windows(proc)
-            else:
-                self._kill_tree_posix(proc)
-        except Exception:
-            logger.exception("Error killing process tree for PID %s", proc.pid)
-
-    def _kill_tree_posix(self, proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
-        """POSIX: send SIGTERM to process group, then SIGKILL after grace."""
-        import signal
-
-        pgid = os.getpgid(proc.pid)
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            proc.wait(timeout=self._kill_grace)
-        except subprocess.TimeoutExpired:
-            logger.warning("Grace period expired — force-killing pgid %d", pgid)
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-
-    def _kill_tree_windows(self, proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
-        """Windows: terminate then taskkill /T /F to kill the tree."""
-        proc.terminate()
-        try:
-            proc.wait(timeout=self._kill_grace)
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                "Grace period expired — force-killing tree for PID %d",
-                proc.pid,
-            )
-            # taskkill /T kills the process and its children.
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True,
-                    shell=False,
-                )
-            except FileNotFoundError:
-                # Fallback: just kill the main process.
-                proc.kill()
 
     # ----- helpers ----------------------------------------------------------
 
@@ -271,8 +184,106 @@ class CommandRunner:
             )
         path.write_bytes(encoded)
 
-    @staticmethod
-    def _write_empty(stdout_path: Path, stderr_path: Path) -> None:
-        """Create empty artifact files for error-before-launch scenarios."""
-        stdout_path.touch()
-        stderr_path.touch()
+
+def run_captured(
+    argv: list[str],
+    *,
+    deadline: float,
+    cwd: Path | str | None = None,
+    env: dict[str, str] | None = None,
+    cleanup_timeout: float = 1,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run an argv in a managed process tree with an absolute monotonic deadline."""
+    if time.monotonic() >= deadline:
+        raise subprocess.TimeoutExpired(argv, 0)
+
+    if _IS_WINDOWS:
+        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000004  # CREATE_SUSPENDED
+        options = {"creationflags": creation_flags}
+    else:
+        options = {"start_new_session": True}
+
+    proc = subprocess.Popen(
+        argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, shell=False, **options,
+    )
+    job = None
+
+    def terminate_tree() -> None:
+        if job is not None:
+            job.terminate()
+        elif _IS_WINDOWS:
+            if proc.poll() is None:
+                proc.kill()
+        else:
+            import signal
+
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    try:
+        if _IS_WINDOWS:
+            job = _WindowsProcessJob(proc)
+        timeout = max(0, deadline - time.monotonic())
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired as exc:
+            terminate_tree()
+            try:
+                exc.output, exc.stderr = proc.communicate(timeout=cleanup_timeout)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+    finally:
+        terminate_tree()
+        if job is not None:
+            job.close()
+
+
+class _WindowsProcessJob:
+    """Contain descendants before the suspended subprocess can start."""
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel.CreateJobObjectW
+        create.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        create.restype = wintypes.HANDLE
+        assign = kernel.AssignProcessToJobObject
+        assign.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        assign.restype = wintypes.BOOL
+        self._terminate = kernel.TerminateJobObject
+        self._terminate.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        self._terminate.restype = wintypes.BOOL
+        self._close = kernel.CloseHandle
+        self._close.argtypes = [wintypes.HANDLE]
+        self._close.restype = wintypes.BOOL
+
+        self.handle = create(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            process_handle = wintypes.HANDLE(int(proc._handle))
+            if not assign(self.handle, process_handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            resume = ctypes.WinDLL("ntdll").NtResumeProcess
+            resume.argtypes = [wintypes.HANDLE]
+            resume.restype = wintypes.LONG
+            status = resume(process_handle)
+            if status < 0:
+                raise OSError(f"NtResumeProcess failed (status {status:#x})")
+        except BaseException:
+            self.close()
+            raise
+
+    def terminate(self) -> None:
+        if not self._terminate(self.handle, 124):
+            logger.error("Could not terminate Windows process job")
+
+    def close(self) -> None:
+        self._close(self.handle)

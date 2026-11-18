@@ -33,6 +33,12 @@ class WorkerConfig:
     heartbeat_seconds: int = 10
     lease_seconds: int = 60
 
+    def __post_init__(self) -> None:
+        if type(self.concurrency) is not int or self.concurrency not in (1, 2):
+            raise ValueError("worker.concurrency must be 1 or 2")
+        if not 0 < self.heartbeat_seconds < self.lease_seconds:
+            raise ValueError("worker settings require 0 < heartbeat_seconds < lease_seconds")
+
 
 @dataclass
 class RunnerConfig:
@@ -100,6 +106,7 @@ class HttpChannelConfig:
     enabled: bool = True
     host: str = "127.0.0.1"
     port: int = 8765
+    max_artifact_bytes: int = 512 * 1024 * 1024
     api_keys: list[str] = field(default_factory=list)
 
 
@@ -119,6 +126,7 @@ class AuthConfig:
     allow_anonymous_cli: bool = True
     users: list[dict[str, Any]] = field(default_factory=list)
     api_tokens: list[str] = field(default_factory=list)
+    http_token_users: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

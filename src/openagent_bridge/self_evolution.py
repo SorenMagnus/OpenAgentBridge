@@ -81,6 +81,26 @@ class HarnessEvolutionEngine:
             bottlenecks=bottlenecks,
         )
 
+    def propose_prompt(self, registry, content: str, version: int):
+        """Record an offline challenger with aggregate training observations."""
+        from openagent_bridge.prompt_registry import PromptTemplate, goal_digest
+
+        if not content.strip():
+            raise ValueError("Candidate guidance cannot be empty")
+        champion = registry.get_champion("coding_task")
+        if not champion:
+            raise ValueError("Bootstrap a baseline first")
+        metrics = self.analyze_task_history()
+        rows = self.db.connection.execute("SELECT original_goal, goal FROM tasks")
+        training_goals = tuple(sorted({goal_digest(row["original_goal"] or row["goal"]) for row in rows}))
+        candidate = PromptTemplate(
+            "coding_task", version, champion.version, content,
+            status="CHALLENGER", training_goals=training_goals,
+        )
+        registry.save_template(candidate)
+        return {"version": version, "training_tasks": metrics.total_tasks,
+                "bottlenecks": metrics.bottlenecks}
+
     def propose_optimizations(self, metrics: EvolutionMetrics) -> list[StrategyProposal]:
         """Formulate bounded strategy adjustments based on historical metrics."""
         proposals = []

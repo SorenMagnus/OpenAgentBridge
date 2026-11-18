@@ -45,6 +45,7 @@ VALID_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         TaskStatus.RUNNING,
         TaskStatus.VERIFYING,
         TaskStatus.CANCELLED,
+        TaskStatus.BUDGET_EXCEEDED,
     }),
     TaskStatus.VALIDATING: frozenset({
         TaskStatus.QUEUED,
@@ -59,6 +60,7 @@ VALID_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         TaskStatus.RUNNING,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
+        TaskStatus.BUDGET_EXCEEDED,
     }),
     TaskStatus.RUNNING: frozenset({
         TaskStatus.VERIFYING,
