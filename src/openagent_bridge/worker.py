@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -12,11 +13,13 @@ from typing import Any
 
 from openagent_bridge.adapters.claude_code import ClaudeCodeAdapter
 from openagent_bridge.adapters.codex import CodexAdapter, is_quota_blocked
+from openagent_bridge.budget import BudgetLimits
 from openagent_bridge.config import BridgeConfig
 from openagent_bridge.db import Database
 from openagent_bridge.models import CommandSpec, TaskStatus
 from openagent_bridge.queue import TaskQueue
 from openagent_bridge.recovery import TaskRecovery
+from openagent_bridge.repair import AutonomousRepairLoop
 from openagent_bridge.repository import RepositoryManager
 from openagent_bridge.runner import CommandRunner
 from openagent_bridge.verifier import Verifier
@@ -202,6 +205,15 @@ class Worker:
             )
             return {"task_id": task_id, "status": "BLOCKED", "reason": "quota_blocked"}
 
+        # Dispatch to AutonomousRepairLoop when autonomy is enabled
+        if (
+            self.config.autonomy.enabled
+            and adapter is not None
+            and worktree_path is not None
+            and worktree_path.exists()
+        ):
+            return self._execute_with_repair_loop(task, worktree_path, adapter)
+
         # Verification
         self.db.transition_task(
             task_id,
@@ -254,6 +266,88 @@ class Worker:
             )
 
         return {"task_id": task_id, "status": final_status, "overall_pass": overall_pass}
+
+    def _repair_budget_limits(self, task: dict[str, Any]) -> BudgetLimits:
+        """Derive BudgetLimits from task's budget field and config defaults."""
+        budget_raw = task.get("budget", {})
+        if isinstance(budget_raw, str):
+            try:
+                budget = json.loads(budget_raw)
+            except Exception:
+                budget = {}
+        elif isinstance(budget_raw, dict):
+            budget = budget_raw
+        else:
+            budget = {}
+
+        autonomy_cfg = self.config.autonomy
+        max_iterations = budget.get("max_iterations") or autonomy_cfg.max_iterations
+        max_wall_minutes = budget.get("max_wall_minutes") or autonomy_cfg.max_wall_minutes
+        max_agent_invocations = (
+            budget.get("max_agent_invocations") or autonomy_cfg.max_agent_invocations
+        )
+        stop_after_no_improvement = autonomy_cfg.stop_after_no_improvement
+
+        return BudgetLimits(
+            max_iterations=int(max_iterations),
+            max_wall_minutes=int(max_wall_minutes),
+            max_agent_invocations=int(max_agent_invocations),
+            stop_after_no_improvement=int(stop_after_no_improvement),
+        )
+
+    def _execute_with_repair_loop(
+        self,
+        task: dict[str, Any],
+        worktree_path: Path,
+        adapter: Any,
+    ) -> dict[str, Any]:
+        """Execute autonomous repair loop for the task."""
+        task_id = str(task["id"])
+        budget_limits = self._repair_budget_limits(task)
+
+        try:
+            loop = AutonomousRepairLoop(
+                db=self.db,
+                runner=self.runner,
+                verifier=self.verifier,
+                budget_limits=budget_limits,
+            )
+            result = loop.run_loop(
+                task=task,
+                worktree_path=worktree_path,
+                adapter=adapter,
+            )
+
+            if self.router:
+                updated_task = self.db.get_task(task_id) or task
+                self.router.dispatch_task_update(
+                    updated_task,
+                    f"Task ended with status {result.final_status} (Overall pass: {result.overall_pass})",
+                )
+
+            return {
+                "task_id": task_id,
+                "status": result.final_status,
+                "overall_pass": result.overall_pass,
+                "iterations_run": result.iterations_run,
+                "stop_reason": result.stop_reason,
+            }
+        except Exception as exc:
+            logger.error("Error in repair loop for task %s: %s", task_id, exc, exc_info=True)
+            try:
+                self.db.transition_task(
+                    task_id,
+                    TaskStatus.FAILED.value,
+                    {"type": "task.failed", "reason": f"repair_loop_error: {exc}"},
+                )
+            except Exception:
+                pass
+            return {
+                "task_id": task_id,
+                "status": TaskStatus.FAILED.value,
+                "overall_pass": False,
+                "error": str(exc),
+            }
 
     def run_forever(self, poll_interval: float = 2.0) -> None:
         """Run worker loop indefinitely until stopped."""
