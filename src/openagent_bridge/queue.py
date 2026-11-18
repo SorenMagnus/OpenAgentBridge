@@ -51,16 +51,14 @@ class TaskQueue:
 
         Returns the claimed task record or None if no tasks are available.
         """
-        now = _utcnow()
-        lease_until = now + timedelta(seconds=lease_seconds)
-        now_str = _iso(now)
-        lease_until_str = _iso(lease_until)
-
         conn = self.db.connection
         cursor = conn.cursor()
 
         try:
             cursor.execute("BEGIN IMMEDIATE")
+            now = _utcnow()
+            now_str = _iso(now)
+            lease_until_str = _iso(now + timedelta(seconds=lease_seconds))
             # Select first available task that is QUEUED and not actively leased
             cursor.execute(
                 """
@@ -126,28 +124,21 @@ class TaskQueue:
 
     def heartbeat(self, task_id: str, worker_id: str, lease_seconds: int = 60) -> bool:
         """Renew the worker's active lease on a task."""
-        now = _utcnow()
-        lease_until = now + timedelta(seconds=lease_seconds)
-        now_str = _iso(now)
-        lease_until_str = _iso(lease_until)
-
         conn = self.db.connection
-        try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = _utcnow()
+            now_str = _iso(now)
+            lease_until = _iso(now + timedelta(seconds=lease_seconds))
             cur = conn.execute(
                 """
                 UPDATE tasks
-                SET heartbeat_at = ?,
-                    lease_until = ?,
-                    updated_at = ?
-                WHERE id = ? AND lease_owner = ?
+                SET heartbeat_at = ?, lease_until = ?, updated_at = ?
+                WHERE id = ? AND lease_owner = ? AND lease_until >= ?
                 """,
-                (now_str, lease_until_str, now_str, task_id, worker_id),
+                (now_str, lease_until, now_str, task_id, worker_id, now_str),
             )
-            conn.commit()
             return cur.rowcount > 0
-        except Exception:
-            conn.rollback()
-            return False
 
     def release(self, task_id: str, worker_id: str) -> None:
         """Release a lease without changing task status."""
@@ -169,26 +160,19 @@ class TaskQueue:
 
     def cancel(self, task_id: str, reason: str = "User requested cancellation") -> bool:
         """Cancel a task and release any active lease."""
-        task = self.db.get_task(task_id)
-        if not task:
-            return False
-
-        current_status = task["status"].upper()
-        if current_status in (TaskStatus.SUCCEEDED.value, TaskStatus.CANCELLED.value):
-            return False
-
+        conn = self.db.connection
         try:
-            self.db.transition_task(
-                task_id,
-                TaskStatus.CANCELLED.value,
-                {"type": "task.cancelled", "reason": reason},
-            )
-            conn = self.db.connection
-            conn.execute(
-                "UPDATE tasks SET lease_owner = NULL, lease_until = NULL WHERE id = ?",
-                (task_id,),
-            )
-            conn.commit()
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self.db._transition_task(
+                    task_id,
+                    TaskStatus.CANCELLED.value,
+                    {"type": "task.cancelled", "reason": reason},
+                )
+                conn.execute(
+                    "UPDATE tasks SET lease_owner = NULL, lease_until = NULL WHERE id = ?",
+                    (task_id,),
+                )
             return True
-        except Exception:
+        except (InvalidTransitionError, ValueError):
             return False
