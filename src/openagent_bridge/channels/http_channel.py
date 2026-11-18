@@ -43,10 +43,16 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
             elif api_key:
                 token = api_key.strip()
 
-            if core.config.auth.enabled:
-                if not token or token not in core.config.auth.api_tokens:
-                    return None
-            return core.acl.authenticate("http", token or "anonymous")
+            auth = core.config.auth
+            if not auth.enabled:
+                return core.acl.authenticate("http", "anonymous")
+            if not token:
+                return None
+            if token in auth.http_token_users:
+                return core.acl.authenticate("http", auth.http_token_users[token])
+            if token in auth.api_tokens:
+                return core.acl.authenticate("http", token)
+            return None
 
         def _authorized_task(self, principal, task_id, action):
             core = adapter.core
@@ -261,7 +267,8 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
                     permissions=data.get("permissions", {}),
                     reply_target=data.get("reply_target", {}),
                 )
-                ok, task_id, err = core.submit_unified_task(req)
+                with adapter.write_lock:
+                    ok, task_id, err = core.submit_unified_task(req)
                 if ok:
                     self._send_json(201, {"task_id": task_id, "status": "QUEUED"})
                 else:
@@ -276,7 +283,10 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
                 if self._authorized_task(principal, task_id, "cancel") is None:
                     return
                 reason = data.get("reason", "Cancelled via HTTP")
-                ok, msg = core.cancel_task(task_id, user_id=principal.id, reason=reason, principal=principal)
+                with adapter.write_lock:
+                    ok, msg = core.cancel_task(
+                        task_id, user_id=principal.id, reason=reason, principal=principal
+                    )
                 if ok:
                     self._send_json(200, {"task_id": task_id, "cancelled": True})
                 else:
@@ -297,7 +307,11 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
                 if self._authorized_task(principal, row["task_id"], "approve" if approved else "reject") is None:
                     return
                 reason = data.get("reason", "")
-                ok, msg = core.resolve_approval(approval_id, user_id=principal.id, approved=approved, reason=reason, principal=principal)
+                with adapter.write_lock:
+                    ok, msg = core.resolve_approval(
+                        approval_id, user_id=principal.id, approved=approved,
+                        reason=reason, principal=principal,
+                    )
                 if ok:
                     self._send_json(200, {"approval_id": approval_id, "resolved": True})
                 else:
@@ -316,6 +330,8 @@ class HTTPChannelAdapter(BaseChannelAdapter):
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8765) -> None:
         super().__init__()
+        # Request threads share the HTTP core's SQLite connection.
+        self.write_lock = threading.Lock()
         self.host = host
         self.port = port
         self.server: ThreadingHTTPServer | None = None

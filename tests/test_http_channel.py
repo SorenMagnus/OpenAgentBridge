@@ -192,3 +192,36 @@ def test_cross_user_writes_leave_task_and_approval_untouched(http_setup):
         assert denied.value.code == 404
     assert core.db.get_task(task)["status"] == "QUEUED"
     assert core.approval_gate.list_pending(task)[0]["id"] == approval
+
+
+def test_concurrent_http_retries_enqueue_once(http_setup):
+    from concurrent.futures import ThreadPoolExecutor
+
+    core, _, base_url = http_setup
+    def submit(_):
+        req = urllib.request.Request(
+            base_url + "/api/v1/tasks",
+            data=json.dumps({"project_id": "sample_proj", "goal": "retry",
+                             "idempotency_key": "concurrent"}).encode(),
+            headers={"X-API-Key": "secret_token_123"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.load(response)["task_id"]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        ids = set(pool.map(submit, range(12)))
+    assert len(ids) == 1
+    assert core.db.get_task(ids.pop())["status"] == "QUEUED"
+
+
+def test_mapped_token_records_stable_owner(http_setup):
+    from openagent_bridge.access_control import User
+
+    core, _, base_url = http_setup
+    core.config.auth.http_token_users = {"test-token": "operator"}
+    core.acl.add_user(User(id="operator", allowed_channels=["http"]))
+    req = urllib.request.Request(base_url + "/tasks", data=b'{"project_id":"sample_proj","goal":"sample"}',
+                                 headers={"X-API-Key": "test-token"})
+    with urllib.request.urlopen(req) as response:
+        task_id = json.load(response)["task_id"]
+    assert core.db.get_task(task_id)["user_id"] == "operator"

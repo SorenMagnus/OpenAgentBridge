@@ -76,6 +76,9 @@ class BridgeCore:
                 return True, legacy["id"], None
             scope = json.dumps([user.id, request.project_id, request.idempotency_key])
             spec["idempotency_key"] = "http:" + hashlib.sha256(scope.encode()).hexdigest()
+            previous = self.db.get_task_by_idempotency_key(spec["idempotency_key"])
+            if previous:
+                return True, previous["id"], None
 
         # 4. Enqueue into database queue
         try:
