@@ -65,7 +65,7 @@ class ApprovalGate:
                 """
                 UPDATE approvals
                 SET status = ?, resolved_at = ?, resolved_by = ?
-                WHERE id = ? AND status = 'pending'
+                WHERE id = ? AND LOWER(status) = 'pending'
                 """,
                 (decision_norm, now, resolved_by, approval_id),
             )

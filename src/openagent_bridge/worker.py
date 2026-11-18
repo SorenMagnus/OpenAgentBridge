@@ -32,6 +32,7 @@ class Worker:
         config: BridgeConfig,
         worker_id: str | None = None,
         db: Database | None = None,
+        router: Any = None,
     ) -> None:
         self.config = config
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
@@ -41,6 +42,7 @@ class Worker:
         self.repo_mgr = RepositoryManager()
         self.runner = CommandRunner(config=config)
         self.verifier = Verifier()
+        self.router = router
         self._stop_requested = False
 
     def is_kill_switched(self) -> bool:
@@ -194,6 +196,13 @@ class Worker:
                 task_id,
                 final_status,
                 {"type": "task.failed", "reason": "verification_failed"},
+            )
+
+        if self.router:
+            updated_task = self.db.get_task(task_id) or task
+            self.router.dispatch_task_update(
+                updated_task,
+                f"Task ended with status {final_status} (Overall pass: {overall_pass})"
             )
 
         return {"task_id": task_id, "status": final_status, "overall_pass": overall_pass}

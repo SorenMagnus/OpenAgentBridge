@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     id                TEXT PRIMARY KEY,
     idempotency_key   TEXT UNIQUE,
     project_id        TEXT,
+    user_id           TEXT DEFAULT 'anonymous',
+    source_channel    TEXT DEFAULT 'cli',
+    reply_target      TEXT,       -- JSON
     goal              TEXT,
     original_goal     TEXT,
     non_goals         TEXT,       -- JSON
@@ -154,6 +157,12 @@ CREATE TABLE IF NOT EXISTS budgets (
     FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
 
+CREATE TABLE IF NOT EXISTS projects (
+    name         TEXT PRIMARY KEY,
+    path         TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_task   ON events(task_id);
 CREATE INDEX IF NOT EXISTS idx_runs_task     ON runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_vr_task       ON verification_results(task_id);
@@ -200,6 +209,15 @@ class Database:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        # Automatic column migration for existing tables
+        cursor = self._conn.execute("PRAGMA table_info(tasks)")
+        existing_cols = {row["name"] for row in cursor.fetchall()}
+        if "user_id" not in existing_cols:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN user_id TEXT DEFAULT 'anonymous'")
+        if "source_channel" not in existing_cols:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN source_channel TEXT DEFAULT 'cli'")
+        if "reply_target" not in existing_cols:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN reply_target TEXT")
         self._conn.commit()
 
     # -- helpers -------------------------------------------------------------
@@ -231,10 +249,11 @@ class Database:
 
         json_cols = {
             "non_goals", "constraints", "acceptance",
-            "executor", "permissions", "budget",
+            "executor", "permissions", "budget", "reply_target",
         }
         task_columns = {
-            "id", "idempotency_key", "project_id", "goal", "original_goal",
+            "id", "idempotency_key", "project_id", "user_id", "source_channel",
+            "reply_target", "goal", "original_goal",
             "non_goals", "constraints", "acceptance", "status", "base_commit",
             "branch", "worktree_path", "created_at", "updated_at", "iteration",
             "max_iterations", "max_wall_minutes", "lease_owner", "lease_until",
@@ -289,6 +308,20 @@ class Database:
         )
         row = cur.fetchone()
         return dict(row) if row else None
+
+    def get_tasks_by_user(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT * FROM tasks WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_tasks_by_channel(self, channel: str, limit: int = 50) -> list[dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT * FROM tasks WHERE source_channel = ? ORDER BY created_at DESC LIMIT ?",
+            (channel, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
 
     def transition_task(
         self,
@@ -521,6 +554,28 @@ class Database:
             "SELECT * FROM verification_results WHERE task_id = ?",
             (task_id,),
         )
+        return [dict(r) for r in cur.fetchall()]
+
+    # -- projects ------------------------------------------------------------
+
+    def register_project(self, name: str, path: str) -> None:
+        """Register or update a project repository path."""
+        now = _utcnow()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO projects (name, path, created_at) VALUES (?, ?, ?)",
+            (name, _to_str(path), now),
+        )
+        self._conn.commit()
+
+    def get_project(self, name: str) -> dict[str, Any] | None:
+        """Lookup a registered project by name."""
+        cur = self._conn.execute("SELECT * FROM projects WHERE name = ?", (name,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        """List all registered projects."""
+        cur = self._conn.execute("SELECT * FROM projects ORDER BY name ASC")
         return [dict(r) for r in cur.fetchall()]
 
     # -- approvals -----------------------------------------------------------

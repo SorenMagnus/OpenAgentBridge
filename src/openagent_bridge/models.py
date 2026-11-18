@@ -160,6 +160,66 @@ class TaskSpec:
         "merge": False,
         "deploy": False,
     })
+    user_id: str = "anonymous"
+    source_channel: str = "cli"
+    reply_target: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class UnifiedTaskRequest:
+    """Universal protocol task request received from any external channel."""
+
+    project_id: str
+    user_goal: str
+    user_id: str = "anonymous"
+    source_channel: str = "cli"
+    task_id: str | None = None
+    idempotency_key: str | None = None
+    non_goals: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    acceptance: dict[str, Any] = field(default_factory=lambda: {
+        "commands": [],
+        "required_files": [],
+        "forbidden_paths": [],
+    })
+    executor: dict[str, str] = field(default_factory=lambda: {
+        "preferred": "codex",
+        "fallback": "",
+    })
+    budget: dict[str, int] = field(default_factory=lambda: {
+        "max_iterations": 5,
+        "max_wall_minutes": 30,
+        "max_agent_invocations": 10,
+    })
+    permissions: dict[str, Any] = field(default_factory=lambda: {
+        "filesystem": "task_worktree",
+        "network": False,
+        "merge": False,
+        "deploy": False,
+    })
+    reply_target: dict[str, Any] = field(default_factory=dict)
+
+    def to_task_spec(self) -> dict[str, Any]:
+        """Convert universal request into standard internal task spec dict."""
+        tid = self.task_id or uuid.uuid4().hex
+        return {
+            "id": tid,
+            "task_id": tid,
+            "idempotency_key": self.idempotency_key or f"{self.source_channel}-{tid}",
+            "project_id": self.project_id,
+            "user_id": self.user_id,
+            "source_channel": self.source_channel,
+            "goal": self.user_goal,
+            "original_goal": self.user_goal,
+            "non_goals": list(self.non_goals),
+            "constraints": list(self.constraints),
+            "acceptance": dict(self.acceptance),
+            "executor": dict(self.executor),
+            "budget": dict(self.budget),
+            "permissions": dict(self.permissions),
+            "reply_target": dict(self.reply_target),
+            "status": TaskStatus.NEW.value,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +237,9 @@ class Task:
     task_id: str = ""
     idempotency_key: str = ""
     project_id: str = ""
+    user_id: str = "anonymous"
+    source_channel: str = "cli"
+    reply_target: dict[str, Any] = field(default_factory=dict)
     goal: str = ""
     original_goal: str = ""
     non_goals: list[str] = field(default_factory=list)

@@ -109,6 +109,7 @@ def cmd_project_add(args: argparse.Namespace) -> int:
     db = Database(db_path)
 
     project_id = info.get("project_id", repo_path.name)
+    db.register_project(project_id, repo_path)
     print(f"Registered project '{project_id}' at {repo_path}")
     print(f"  branch: {info.get('branch', 'unknown')}")
     print(f"  HEAD:   {info.get('head_sha', 'unknown')}")

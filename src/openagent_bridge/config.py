@@ -80,6 +80,47 @@ class AgentConfig:
     fallback: str = "claude-code"
 
 
+@dataclass
+class TelegramConfig:
+    """Settings for Telegram bot channel adapter."""
+
+    enabled: bool = False
+    bot_token: str = ""
+    allowed_chat_ids: list[int] = field(default_factory=list)
+    allowed_user_ids: list[int] = field(default_factory=list)
+    poll_interval_seconds: float = 1.0
+    proxy_url: str = ""
+    api_base_url: str = "https://api.telegram.org"
+
+
+@dataclass
+class HttpChannelConfig:
+    """Settings for HTTP/REST channel adapter."""
+
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 8765
+    api_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ChannelsConfig:
+    """Multi-platform channel configurations."""
+
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    http: HttpChannelConfig = field(default_factory=HttpChannelConfig)
+
+
+@dataclass
+class AuthConfig:
+    """Multi-user and role-based access control settings."""
+
+    enabled: bool = True
+    allow_anonymous_cli: bool = True
+    users: list[dict[str, Any]] = field(default_factory=list)
+    api_tokens: list[str] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
@@ -101,6 +142,8 @@ class BridgeConfig:
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     watcher: WatcherConfig = field(default_factory=WatcherConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    auth: AuthConfig = field(default_factory=AuthConfig)
+    channels: ChannelsConfig = field(default_factory=ChannelsConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +207,13 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
     data_dir_raw = raw.get("data_dir")
     data_dir = Path(data_dir_raw).expanduser() if data_dir_raw else BridgeConfig().data_dir
 
+    channels_raw = raw.get("channels") or {}
+    telegram_cfg = _build_sub(TelegramConfig, channels_raw.get("telegram"))
+    http_cfg = _build_sub(HttpChannelConfig, channels_raw.get("http"))
+    channels_cfg = ChannelsConfig(telegram=telegram_cfg, http=http_cfg)
+
+    auth_cfg = _build_sub(AuthConfig, raw.get("auth"))
+
     return BridgeConfig(
         data_dir=data_dir,
         worker=_build_sub(WorkerConfig, raw.get("worker")),
@@ -172,4 +222,6 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
         policy=_build_sub(PolicyConfig, raw.get("policy")),
         watcher=_build_sub(WatcherConfig, raw.get("watcher")),
         agent=_build_sub(AgentConfig, raw.get("agent")),
+        auth=auth_cfg,
+        channels=channels_cfg,
     )
