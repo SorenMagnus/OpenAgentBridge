@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -65,6 +67,15 @@ class BridgeCore:
 
         # 3. Convert to internal TaskSpec dict
         spec = request.to_task_spec()
+        spec["user_id"] = user.id
+        if request.source_channel == "http" and request.idempotency_key:
+            # Preserve retries against pre-upgrade rows owned by this caller.
+            legacy = self.db.get_task_by_idempotency_key(request.idempotency_key)
+            if (legacy and legacy["source_channel"] == "http" and legacy["user_id"] == user.id
+                    and legacy["project_id"] == request.project_id):
+                return True, legacy["id"], None
+            scope = json.dumps([user.id, request.project_id, request.idempotency_key])
+            spec["idempotency_key"] = "http:" + hashlib.sha256(scope.encode()).hexdigest()
 
         # 4. Enqueue into database queue
         try:
@@ -144,6 +155,10 @@ class BridgeCore:
             "updated_at": task.get("updated_at"),
             "verification_results": v_results,
             "runs_count": len(runs),
+            "runs": [
+                {key: run[key] for key in ("id", "iteration", "agent", "model", "usage")}
+                for run in runs
+            ],
         }
 
     def resolve_approval(

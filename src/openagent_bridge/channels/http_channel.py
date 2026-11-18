@@ -244,6 +244,9 @@ def _make_http_handler(adapter: HTTPChannelAdapter):
             if (len(parts) == 3 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "tasks") or (
                 len(parts) == 1 and parts[0] == "tasks"
             ):
+                if data.get("idempotency_key") is not None and not isinstance(data["idempotency_key"], str):
+                    self._send_json(400, {"error": "idempotency_key must be a string"})
+                    return
                 req = UnifiedTaskRequest(
                     project_id=data.get("project_id", data.get("project_name", "")),
                     user_goal=data.get("goal", data.get("user_goal", "")),
