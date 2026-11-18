@@ -12,6 +12,7 @@ license = "MIT"
 keywords = ["ai", "agent", "orchestration", "bridge"]
 dependencies = [
     "psutil",
+    "watchdog",
 ]
 
 [project.optional-dependencies]

@@ -443,6 +443,91 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 commands: worker, events, recover, cancel
+# ---------------------------------------------------------------------------
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    """Run worker loop."""
+    from openagent_bridge.config import load_config
+    from openagent_bridge.worker import Worker
+
+    config = load_config(Path(args.config) if args.config else None)
+    worker = Worker(config=config, worker_id=args.worker_id)
+    if args.once:
+        res = worker.run_once()
+        print("Worker run_once finished:", res)
+        return 0
+
+    print(f"Worker {worker.worker_id} starting (concurrency=1)...")
+    try:
+        worker.run_forever()
+    except KeyboardInterrupt:
+        print("\nStopping worker...")
+        worker.stop()
+    return 0
+
+
+def cmd_events(args: argparse.Namespace) -> int:
+    """Query or stream events for a task."""
+    from openagent_bridge.config import load_config
+    from openagent_bridge.db import Database
+    from openagent_bridge.events import EventManager
+
+    config = load_config(Path(args.config) if args.config else None)
+    db = Database(config.data_dir / "bridge.db")
+    em = EventManager(db)
+
+    if args.follow:
+        print(f"Streaming events for task {args.task_id} (Ctrl+C to stop)...")
+        try:
+            for evt in em.follow(args.task_id):
+                print(f"[{evt.get('sequence', '?')}] {evt.get('timestamp', '')} {evt.get('type', '')} ({evt.get('source', '')}): {evt.get('payload', {})}")
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+    events = em.get_events(args.task_id)
+    print(f"Events for task {args.task_id} ({len(events)}):")
+    for evt in events:
+        print(f"  [{evt.get('sequence', '?')}] {evt.get('timestamp', '')} {evt.get('type', '')} ({evt.get('source', '')}): {evt.get('payload', {})}")
+    return 0
+
+
+def cmd_recover(args: argparse.Namespace) -> int:
+    """Recover orphaned or crashed tasks with expired leases."""
+    from openagent_bridge.config import load_config
+    from openagent_bridge.db import Database
+    from openagent_bridge.recovery import TaskRecovery
+
+    config = load_config(Path(args.config) if args.config else None)
+    db = Database(config.data_dir / "bridge.db")
+    recovery = TaskRecovery(db, config.data_dir)
+    recovered = recovery.recover_all()
+    print(f"Recovered {len(recovered)} tasks:")
+    for r in recovered:
+        print(f"  Task {r['task_id']} -> {r['recovered_status']}")
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    """Cancel a task."""
+    from openagent_bridge.config import load_config
+    from openagent_bridge.db import Database
+    from openagent_bridge.queue import TaskQueue
+
+    config = load_config(Path(args.config) if args.config else None)
+    db = Database(config.data_dir / "bridge.db")
+    queue = TaskQueue(db)
+    reason = args.reason or "Cancelled via CLI"
+    success = queue.cancel(args.task_id, reason=reason)
+    if success:
+        print(f"Task {args.task_id} cancelled.")
+        return 0
+    print(f"Failed to cancel task {args.task_id} (task not found or already terminal).", file=sys.stderr)
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # argument parser
 # ---------------------------------------------------------------------------
 
@@ -487,6 +572,24 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("pause", help="Pause processing (create STOP file)")
     subparsers.add_parser("resume", help="Resume processing (remove STOP file)")
 
+    # worker
+    worker_parser = subparsers.add_parser("worker", help="Run background worker")
+    worker_parser.add_argument("--worker-id", default=None, help="Custom worker ID")
+    worker_parser.add_argument("--once", action="store_true", help="Process only one task and exit")
+
+    # events
+    events_parser = subparsers.add_parser("events", help="Query or follow task events")
+    events_parser.add_argument("task_id", help="Task ID")
+    events_parser.add_argument("--follow", "-f", action="store_true", help="Follow event stream in real time")
+
+    # recover
+    subparsers.add_parser("recover", help="Recover crashed tasks with expired leases")
+
+    # cancel
+    cancel_parser = subparsers.add_parser("cancel", help="Cancel a task")
+    cancel_parser.add_argument("task_id", help="Task ID to cancel")
+    cancel_parser.add_argument("--reason", default=None, help="Reason for cancellation")
+
     return parser
 
 
@@ -503,6 +606,10 @@ def main(argv: list[str] | None = None) -> int:
         "doctor": cmd_doctor,
         "pause": cmd_pause,
         "resume": cmd_resume,
+        "worker": cmd_worker,
+        "events": cmd_events,
+        "recover": cmd_recover,
+        "cancel": cmd_cancel,
     }
 
     if args.command in dispatch:

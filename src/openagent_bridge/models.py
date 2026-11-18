@@ -94,6 +94,7 @@ VALID_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         TaskStatus.CANCELLED,
     }),
     TaskStatus.RECOVERING: frozenset({
+        TaskStatus.QUEUED,
         TaskStatus.PREPARING,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,

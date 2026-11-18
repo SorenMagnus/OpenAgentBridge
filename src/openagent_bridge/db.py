@@ -172,7 +172,7 @@ _VALID_TRANSITIONS: dict[str, set[str]] = {
     "VERIFYING":        {"SUCCEEDED", "REPAIR_PLANNED", "REVIEW_REQUIRED", "FAILED", "CANCELLED"},
     "REPAIR_PLANNED":   {"RUNNING", "QUEUED", "FAILED", "CANCELLED", "BUDGET_EXCEEDED"},
     "REVIEW_REQUIRED":  {"SUCCEEDED", "REPAIR_PLANNED", "FAILED", "CANCELLED"},
-    "RECOVERING":       {"RUNNING", "PREPARING", "FAILED", "CANCELLED"},
+    "RECOVERING":       {"QUEUED", "RUNNING", "PREPARING", "FAILED", "CANCELLED"},
     "BLOCKED":          {"QUEUED", "VALIDATING", "CANCELLED", "FAILED"},
     "SUCCEEDED":        {"REVIEW_REQUIRED"},
     "FAILED":           {"QUEUED", "RECOVERING", "CANCELLED"},
@@ -310,9 +310,13 @@ class Database:
             )
             next_seq = seq_cur.fetchone()[0]
 
+            event_type = (event_payload or {}).get("type", "status_transition")
+            event_source = (event_payload or {}).get("source", "db")
+            event_severity = (event_payload or {}).get("severity", "INFO")
+
             payload = {
                 "from_status": current_status,
-                "to_status": new_status,
+                "to_status": target_status,
                 **(event_payload or {}),
             }
             self._conn.execute(
@@ -321,11 +325,11 @@ class Database:
                 (
                     event_id,
                     task_id,
-                    "status_transition",
+                    event_type,
                     now,
                     next_seq,
-                    "db",
-                    "INFO",
+                    event_source,
+                    event_severity,
                     json.dumps(payload),
                 ),
             )
