@@ -213,4 +213,3 @@ def serve_artifact(handler, core, task, parts):
                 break
             handler.wfile.write(chunk)
             remaining -= len(chunk)
-

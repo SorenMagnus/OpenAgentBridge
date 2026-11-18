@@ -197,4 +197,3 @@ def test_reject_changed_snapshot(delivery, tmp_path, legacy):
     with pytest.raises(HTTPError) as changed:
         fetch(f"{base}/{task}/artifacts/{key}")
     assert changed.value.code == 409
-
